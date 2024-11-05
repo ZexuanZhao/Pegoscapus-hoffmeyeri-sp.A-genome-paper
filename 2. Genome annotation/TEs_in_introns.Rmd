@@ -1,0 +1,116 @@
+---
+title: "intron_TE"
+author: "Zexuan Zhao"
+date: "2023-08-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(biomartr)
+library(GenomicRanges)
+library(tidyverse)
+TE_annotation_file <- "../data/v4.W2A.TE_annotation.TEanno.gff3"
+gene_annotation_file <- "../data/final_functional_genes_annotation.addintron.gff"
+```
+
+## Load data
+
+```{r}
+introns_gr <- read_gff(gene_annotation_file) %>% 
+  filter(type == "intron") %>% 
+  filter(str_detect(seqid, "chr")) %>% 
+  mutate(strand ="+") %>% 
+  makeGRangesFromDataFrame() %>% 
+  GenomicRanges::reduce()
+```
+
+## Calculate overlapping size
+
+```{r}
+TE_in_intron <- tibble()
+for (t in read_gff(TE_annotation_file) %>% distinct(type) %>% pull(type)){
+  TE_type_gr <- read_gff(TE_annotation_file) %>% 
+    filter(type == t) %>% 
+    filter(str_detect(attribute, "Method=homology")) %>% 
+    mutate(strand = "+") %>% # Put all TE on + strand, so that overlapping TEs can be merged
+    filter(str_detect(seqid, "chr")) %>% 
+    makeGRangesFromDataFrame() %>% 
+    GenomicRanges::reduce()# Merge overlapping TE regions
+  s <- GenomicRanges::intersect(introns_gr, TE_type_gr) %>% width() %>% sum() / 10^6
+  
+  TE_in_intron <- TE_in_intron %>% 
+    bind_rows(tibble(TE = t, size = s))
+}
+
+```
+
+## Get size of genes that overlap with TEs
+
+```{r}
+gene_gr <- read_gff(gene_annotation_file) %>% 
+  filter(type == "gene") %>% 
+  mutate(strand ="+") %>% 
+  makeGRangesFromDataFrame()
+
+TE_gr <- read_gff(TE_annotation_file) %>% 
+    filter(str_detect(attribute, "Method=homology")) %>% 
+    mutate(strand = "+") %>% # Put all TE on + strand, so that overlapping TEs can be merged
+    filter(str_detect(seqid, "chr")) %>% 
+    makeGRangesFromDataFrame() %>% 
+    GenomicRanges::reduce()
+```
+```{r}
+gene_size <- gene_gr %>% width()
+gene_overlap_with_TE_size <- subsetByOverlaps(gene_gr, TE_gr) %>% width()
+
+x <- gene_size
+y <- gene_overlap_with_TE_size
+z <- vector()
+for(i in x){
+  if (i %in% y){
+    y[which(y == i)[1]] <- NA
+    next
+  }
+  z <- c(z, i)
+}
+gene_not_overlap_with_TE_size <- z
+
+length(gene_overlap_with_TE_size) + length(gene_not_overlap_with_TE_size) == length(gene_size)
+
+tibble(size = gene_not_overlap_with_TE_size, label = "Not overlap with TE") %>% 
+  bind_rows(tibble(size = gene_overlap_with_TE_size, label = "Overlap with TE")) %>% 
+  ggplot(aes(x = size, fill = label)) +
+    geom_density(alpha=0.5, position="identity") +
+    scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x),
+                  labels = scales::trans_format("log10", scales::math_format(10^.x)),
+                  limits = c(10^3, 10^6)) +
+    theme_classic() +
+    ylab("Probability density") +
+    xlab("Gene size (bp)")
+    
+tibble(size = gene_not_overlap_with_TE_size, label = "Not overlap with TE") %>% 
+  bind_rows(tibble(size = gene_overlap_with_TE_size, label = "Overlap with TE")) %>% 
+  ggboxplot(x = "label", y = "size",
+            color = "label", palette = "jco",
+            add = "jitter",
+            add.params = list(size = 0.1, alpha = 0.2)) + 
+    stat_compare_means()+
+    scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x),
+                  labels = scales::trans_format("log10", scales::math_format(10^.x)),
+                  limits = c(10^3, 10^6)) +
+    ylab("Size (bp)") +
+    xlab("Gene") +
+    guides(color = guide_legend(title="")) +
+    theme(legend.position = "right")
+
+ggsave("../figures/gene size overlap with TE.png")
+```
+
+```{r}
+tibble(size = gene_not_overlap_with_TE_size, label = "Not overlap with TE") %>% 
+  bind_rows(tibble(size = gene_overlap_with_TE_size, label = "Overlap with TE")) %>% 
+  group_by(label) %>% 
+  summarize(median_size = median(size))
+```
+

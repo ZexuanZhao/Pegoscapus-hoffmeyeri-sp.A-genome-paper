@@ -1,0 +1,223 @@
+---
+title: "TE composition and landscape"
+author: "Zexuan Zhao"
+date: "2023-06-14"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggforce)
+library(ggpubr)
+library(gridExtra)
+library(grid)
+library(tidyverse)
+
+summary_file <- "W2A.TE.summary_by_class.xlsx"
+landscape_file <- "W2A.TE.kimura_divergence.xlsx"
+```
+## Composition
+
+```{r}
+composition_simplified <- readxl::read_xlsx(summary_file, sheet = 2)
+```
+
+```{r}
+colors_simplified <- c("Retrotransposon/LTR/Copia" = "#f9584b",
+                       "Retrotransposon/LTR/Gypsy" = "#ff8980",
+                       "DNA transposons/Helitron/Helitron" = "#CD7F32",
+                       "DNA transposons/TIR/Tc1_Mariner" = "#CC5500",
+                       "DNA transposons/TIR/Mutator" = "#FFAC1C",
+                       "DNA transposons/TIR/CACTA" = "#ffe173",
+                       "Other superfamilies" = "#80e8e0",
+                       "Classified TE" = "#EE4B2B",
+                       "Unclassified TE" = "#ccd6db",
+                       "Non-TE" = "#d3ebed")
+```
+
+
+```{r}
+composition_simplified_aug <- composition_simplified %>% 
+  mutate(percent = percent / sum(percent)) %>% 
+  group_by(type, idx) %>% 
+  summarize(percent = sum(percent)) %>% 
+  arrange(idx) %>% 
+  ungroup() %>% 
+  mutate(arc_start = cumsum(lag(percent, default = 0)) * 2*pi,
+         arc_end   = cumsum(percent) * 2*pi,
+         arc_mid = (arc_start + arc_end)/2,
+         x_pos = 0 + cos(arc_start - pi/2),
+         y_pos = 1 - sin(arc_start - pi/2))
+```
+
+```{r}
+composition_simplified_detail <- composition_simplified %>% 
+  filter(type == "Classified TE") %>%
+  purrr::map_df(rev) %>%    # This reverses the order
+  mutate(percent_scaled = percent / sum(percent) * 2)%>% 
+  ungroup() 
+```
+
+
+```{r}
+composition_simplified_line <- composition_simplified_aug %>% 
+  filter(type == "Classified TE" | lag(type == "Classified TE")) %>%
+  slice(1, n()) %>% 
+  ungroup()
+```
+
+```{r}
+rlabel <- 0.5
+p1 <- ggplot() +
+  geom_arc_bar(data = composition_simplified_aug,
+                        aes(x0 = 0, y0 = 1, 
+                            r0 = 0, r  = 1,
+                            fill = type,
+                            start = arc_start,
+                            end   = arc_end), color = NA) +
+  geom_text(data = composition_simplified_aug,
+            aes(label = percent * 100, 
+                x =  rlabel * sin(arc_mid), y = rlabel * cos(arc_mid) + 1)) +
+  scale_fill_manual(values = colors_simplified,
+                    breaks = names(colors_simplified)[(length(names(colors_simplified))-2):length(names(colors_simplified))]) +
+  guides(fill = guide_legend(title="Genome annotation")) + 
+  ggnewscale::new_scale_fill() + 
+  geom_tile(data = composition_simplified_detail,
+            aes(x = 2, y = cumsum(percent_scaled) - percent_scaled/2,
+                height = percent_scaled, 
+                fill = name)) +
+  geom_text(data = composition_simplified_detail,
+            aes(label = ifelse(percent > 1, percent, ""), 
+                x = 2, y = cumsum(percent_scaled) - percent_scaled/2)) +
+  annotate("segment", 
+           x = composition_simplified_line[1:2, "x_pos"] %>% pull(),
+           y = composition_simplified_line[1:2, "y_pos"] %>% pull(),
+           xend = 1.5,
+           yend = c(2,0)) +
+  scale_fill_manual(values = colors_simplified,
+                    breaks = names(colors_simplified)[1:(length(names(colors_simplified))-3)]) +
+  coord_equal() +
+  theme_void() + 
+  guides(fill = guide_legend(title="TE superfamilies"))
+ggsave("../figures/TE composition.png", plot = p1)
+```
+
+## Landscape
+
+Look up table here:
+https://github.com/oushujun/EDTA/blob/master/util/TE_Sequence_Ontology.txt
+
+```{r}
+nomenclature <- read_tsv("https://raw.githubusercontent.com/oushujun/EDTA/master/util/TE_Sequence_Ontology.txt",
+                          comment = "#",
+                          col_names = c("name", "SO", "alias")) %>% 
+  separate_rows(alias, sep = ",")
+
+nomenclature_v <- nomenclature$name
+names(nomenclature_v) <- nomenclature$alias
+nomenclature_v <- c(nomenclature_v, "TIR/Kolobok" = "Kolobok_TIR_transposon")
+```
+
+```{r}
+genomes_size <- 511793463
+bin_size <- 0.5
+
+ins_time <- readxl::read_xlsx(landscape_file, sheet=2) %>% 
+  gather(key = "Class", value = "wellCharLen", -Div) %>% 
+  group_by(Class, Div) %>% 
+  summarize(size = sum(wellCharLen)) %>% 
+  mutate(p = size/genomes_size*100) %>% 
+  mutate(name = nomenclature_v[Class]) %>% 
+  mutate(name = ifelse(name == "repeat_region", "Unclassified TE", name)) %>% 
+  mutate(name = ifelse(name == "helitron", "DNA transposons/Helitron/Helitron", name)) %>% 
+  mutate(name = ifelse(name == "Gypsy_LTR_retrotransposon", "Retrotransposon/LTR/Gypsy", name)) %>% 
+  mutate(name = ifelse(name == "Mutator_TIR_transposon", "DNA transposons/TIR/Mutator", name)) %>% 
+  mutate(name = ifelse(name == "Tc1_Mariner_TIR_transposon", "DNA transposons/TIR/Tc1_Mariner", name)) %>% 
+  mutate(name = ifelse(name == "Copia_LTR_retrotransposon", "Retrotransposon/LTR/Copia", name)) %>% 
+  mutate(name = ifelse(name == "CACTA_TIR_transposon", "DNA transposons/TIR/CACTA", name)) %>% 
+  mutate(name = ifelse(name == "LTR_retrotransposon", "Unclassified TE", name)) %>% 
+  mutate(name = ifelse(name == "LINE_element", "Unclassified TE", name)) %>% 
+  mutate(name = ifelse(name == "PIF_Harbinger_TIR_transposon", "Other superfamilies", name)) %>% 
+  mutate(name = ifelse(name == "hAT_TIR_transposon", "Other superfamilies", name)) %>% 
+  mutate(name = ifelse(name == "DNA_transposon", "Unclassified TE", name)) %>% 
+  mutate(name = ifelse(name == "P_TIR_transposon", "Other superfamilies", name)) %>% 
+  mutate(name = ifelse(name == "Penelope_retrotransposon", "Other superfamilies", name)) %>% 
+  mutate(name = ifelse(name == "Kolobok_TIR_transposon", "Other superfamilies", name)) %>% 
+  group_by(name, Div) %>% 
+  summarize(p = sum(p)) %>% 
+  ungroup()
+```
+```{r}
+p2 <- ins_time %>% 
+  filter(p > 0) %>% 
+  ggplot(aes(x = Div, y = p, fill = name)) +
+    geom_col()+
+    theme_classic() +
+    scale_fill_manual(values = colors_simplified) +
+    scale_x_reverse(limits = c(60, -2))+
+    xlab("Kimura substitution level") +
+    ylab("Percent of genome (%)")  +
+    theme(
+    axis.title.x = element_text(size = 8),
+    axis.text.x = element_text(size = 6),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_text(size = 6)) +
+    guides(fill=guide_legend(title="TE superfamilies"))
+ggsave("../figures/TE landscape.png", plot = p2)
+```
+```{r}
+ins_time %>% 
+  group_by(Div) %>% 
+  summarize(t_p = sum(p)) %>% 
+  arrange(desc(t_p)) %>% 
+  mutate(cum_t_p = cumsum(t_p)/sum(t_p))
+```
+
+
+
+## Two plots togeter
+
+```{r}
+p0 <- ggplot() +
+  geom_arc_bar(data = composition_simplified_aug,
+                        aes(x0 = 0, y0 = 1, 
+                            r0 = 0, r  = 1,
+                            fill = type,
+                            start = arc_start,
+                            end   = arc_end), color = NA) +
+  geom_text(data = composition_simplified_aug,
+            aes(label = percent * 100, 
+                x =  rlabel * sin(arc_mid), y = rlabel * cos(arc_mid) + 1)) +
+  scale_fill_manual(values = colors_simplified,
+                    breaks = names(colors_simplified)[(length(names(colors_simplified))-2):length(names(colors_simplified))]) +
+  guides(fill = guide_legend(title="Genome annotation"))+
+  theme(legend.key.size = unit(0.5, 'cm'), 
+        legend.key.height = unit(0.5, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), #
+        legend.title = element_text(size=8), 
+        legend.text = element_text(size=6))
+legend1 <- p0 %>% 
+  get_legend(position = "bottom")
+p2.5 <- p2 +
+    theme(legend.key.size = unit(0.5, 'cm'), 
+        legend.key.height = unit(0.5, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), #
+        legend.title = element_text(size=8), 
+        legend.text = element_text(size=6)) 
+legend2 <- get_legend(p2.5,position = "bottom")
+```
+
+```{r}
+p <- grid.arrange(arrangeGrob(p1 + theme(legend.position="none"), 
+                         p2 + theme(legend.position="none"), 
+                         nrow = 1, ncol = 2), 
+                   legend1,
+                   legend2,
+                   nrow=3,
+                   ncol = 1,
+                   heights=c(10, 1, 2))
+p
+ggsave("../figures/TE composition and landscape.png", plot = p,
+        width = 210, height = 120, units = "mm")
+```
+

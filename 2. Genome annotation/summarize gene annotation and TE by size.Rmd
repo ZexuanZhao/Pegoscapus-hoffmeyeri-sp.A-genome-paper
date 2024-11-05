@@ -1,0 +1,105 @@
+---
+title: "Separate Genome Components"
+author: "Zexuan Zhao"
+date: "2023-07-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(GenomicRanges)
+library(tidyverse)
+```
+
+## Prepare data
+
+```{r}
+chr_lengths <- read_tsv("../data/v4.1.W2A_genome_assembly.fasta.fai",
+                        col_names = c("chr","length","bits","spacer1","spacer2")) %>% 
+  dplyr::select(chr, length)
+gene <- biomartr::read_gff("../data/final_functional_genes_annotation.addintron.gff") %>% 
+  mutate(strand = "*")
+TE <- biomartr::read_gff("../data/v4.W2A.TE_annotation.TEanno.gff3") %>% 
+  mutate(strand = "*")
+```
+
+### Merge overlaps
+
+```{r}
+genome_gr <- chr_lengths %>% 
+  filter(str_detect(chr, "chr")) %>% 
+  mutate(start = 1, end = length) %>% 
+  makeGRangesFromDataFrame()
+gene_gr <- gene %>% 
+  filter(type == "gene") %>% 
+  filter(str_detect(seqid, "chr")) %>% 
+  makeGRangesFromDataFrame() %>% 
+  GenomicRanges::reduce()
+intron_gr <- gene %>% 
+  filter(type == "intron") %>% 
+  filter(str_detect(seqid, "chr")) %>% 
+  makeGRangesFromDataFrame() %>% 
+  GenomicRanges::reduce()
+exon_gr <- gene %>% 
+  filter(type == "exon") %>% 
+  filter(str_detect(seqid, "chr")) %>% 
+  makeGRangesFromDataFrame() %>% 
+  GenomicRanges::reduce()
+intergenic_gr <- genome_gr %>% 
+  GenomicRanges::setdiff(gene_gr)
+intergenic_gr
+gene_gr
+```
+
+```{r}
+TE_gr <- TE %>% 
+  filter(str_detect(seqid, "chr")) %>% 
+  makeGRangesFromDataFrame() %>% 
+  GenomicRanges::reduce()
+
+non_TE_gr <- genome_gr %>% 
+  GenomicRanges::setdiff(TE_gr)
+```
+
+
+## Intersection
+
+```{r}
+gene_annotation <- c("exon_gr", "intron_gr", "intergenic_gr")
+TE_annotation <- c("TE_gr", "non_TE_gr")
+gene_annotation_gr <- list(exon_gr, intron_gr, intergenic_gr)
+names(gene_annotation_gr) <- gene_annotation
+TE_annotation_gr <- list(TE_gr, non_TE_gr)
+names(TE_annotation_gr) <- TE_annotation
+
+
+parameters_tb <- do.call(expand.grid, list(gene_annotation, TE_annotation, stringsAsFactors = FALSE))
+parameters_tb$n_intersect <- -1
+for(i in 1:nrow(parameters_tb)){
+  var1 <- parameters_tb[i, "Var1"]
+  var2 <- parameters_tb[i, "Var2"]
+  intersect_gr <- GenomicRanges::intersect(gene_annotation_gr[[var1]], TE_annotation_gr[[var2]]) 
+  parameters_tb[i, "n_intersect"] <- intersect_gr %>% 
+    width() %>% 
+    sum()
+  intersect_gr %>% 
+    as_tibble() %>% 
+    select(chrom = seqnames, chromStart = start, chromEnd = end) %>% 
+    write_tsv(file.path("..", "data", 
+                        paste(var1 %>% str_remove("_gr"), 
+                              var2 %>% str_remove("_gr"), 
+                              "bed", 
+                              sep = ".")
+                        )
+              )
+}
+
+genomic_component <- parameters_tb %>% 
+  select(genome_annotation=Var1, TE_annotation = Var2, size = n_intersect) %>% 
+  mutate(size = size/10^6) %>% 
+  mutate(genome_annotation = str_remove(genome_annotation, "_gr")) %>% 
+  mutate(TE_annotation = str_remove(TE_annotation, "_gr"))
+
+write_tsv(genomic_component, "../data/genomic_component.tsv")
+```
+

@@ -1,0 +1,184 @@
+---
+title: "Circular genome plot"
+author: "Zexuan Zhao"
+date: "2024-02-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(parallel)
+library(OmicCircos)
+library(Biostrings)
+library(GenomicRanges)
+library(tidyverse)
+
+fai_file <- "v4.1.W2A_genome_assembly.fasta.fai"
+genome_file <- "v4.1.W2A_genome_assembly.fasta"
+gene_file <- "final_functional_annotation.gff"
+TE_density_file <- "TE_density.tsv"
+pi_file <- "combined_pi.txt"
+methylation_file <- "methylation_binned.tsv"
+
+cores <- 7
+options(stringsAsFactors = FALSE)
+
+list_to_tb <- function(list_in){
+  do.call(bind_rows, list_in)
+}
+```
+
+## Load genome data
+
+```{r}
+chromosome_segments <- read_tsv(fai_file,
+                         col_names = c("chrom", "chromEnd", "V3", "V4", "v5")) %>% 
+  mutate(chromStart = 1) %>% 
+  select(chrom, chromStart, chromEnd) %>% 
+  filter(str_detect(chrom, "chr")) 
+
+genome <- readDNAStringSet(genome_file)
+nuclear <- genome[str_detect(names(genome), "chr")]
+genome_info <- GenomeInfoDb::Seqinfo(seqnames = names(nuclear),
+                                     seqlengths = width(nuclear),
+                                     isCircular = NA,
+                                     genome = NA)
+
+ns <- read_tsv("Ns.bed", col_names = c("chr", "start", "end")) %>% 
+  mutate(pos = (start+end)/2) %>% 
+  select(chr, pos) %>% 
+  as.data.frame()
+```
+
+## Load gene data
+
+```{r}
+gene_pos <- biomartr::read_gff(gene_file) %>% 
+  filter(str_detect(seqid, "chr")) %>% 
+  filter(type == "gene") %>% 
+  makeGRangesFromDataFrame() %>% 
+  GenomicRanges::reduce() %>% 
+  as_tibble() %>% 
+  mutate(pos = (start+end)/2) %>% 
+  select(seqnames, pos)
+```
+
+
+## Make windows
+
+```{r}
+windows_10kb <- tileGenome(genome_info, tilewidth = 10*1000, cut.last.tile.in.chrom = TRUE) %>% split()
+windows_50kb <- tileGenome(genome_info, tilewidth = 50*1000, cut.last.tile.in.chrom = TRUE) %>% split()
+windows_100kb <- tileGenome(genome_info, tilewidth = 100*1000, cut.last.tile.in.chrom = TRUE) %>% split()
+```
+
+## GC content
+
+```{r eval=FALSE}
+calculate_gc_in_window <- function(window, genome){
+  seq <- genome[window]
+  gc <- sum(letterFrequency(seq, letters = c("G", "C")))/width(seq)
+  tb <- as_tibble(window) %>% 
+    select(chr = seqnames, start, end) %>% 
+    mutate(gc = gc)
+  return(tb)
+}
+
+gc_track_10kb <- mclapply(windows_10kb, calculate_gc_in_window, genome = genome, mc.cores = cores) %>% 
+  list_to_tb()
+
+saveRDS(gc_track_10kb, "gc_track_10kb.rds")
+```
+
+```{r}
+gc_track_10kb <- read_rds("gc_track_10kb.rds") %>% 
+  mutate(pos = floor((start+end)/2)) %>% 
+  select(chr, pos, gc) %>% 
+  as.data.frame() ## Because OmicCircos is not compatible with tibble in dplyr
+```
+
+
+## Gene density
+
+```{r eval=FALSE}
+calculate_gene_density <- function(window, df){
+  chr_name <- seqnames(window) %>% as.character()
+  s <- start(window)
+  e <- end(window)
+  df_in_window <- df %>% 
+      filter(seqnames == chr_name & pos >= s & pos <= e)
+  return(tibble(chr = chr_name,
+                start = s,
+                end = e,
+                n = nrow(df_in_window)))
+}
+
+gene_density <- mclapply(windows_10kb, calculate_gene_density, df = gene_pos, mc.cores = cores) %>% 
+  list_to_tb()
+saveRDS(gene_density, "gene_density.rds")
+```
+```{r}
+gene_density <- read_rds("gene_density.rds") %>% 
+  mutate(pos = floor((start+end)/2)) %>% 
+  select(chr, pos, n) %>% 
+  filter(n>0) %>% 
+  as.data.frame() ## Because OmicCircos is not compatible with tibble in dplyr
+```
+
+## TE density
+
+```{r}
+TE_density <- read_tsv(TE_density_file) %>% 
+  select(chr, pos, p) %>% 
+  as.data.frame()
+```
+
+## Pi
+
+```{r}
+pi <- read_tsv("combined_pi.txt") %>% 
+  mutate(pos = floor((window_pos_1 + window_pos_2)/2)) %>% 
+  select(chromosome, pos, avg_pi) %>% 
+  mutate(log_pi = log10(avg_pi)) %>% 
+  filter(!is.infinite(log_pi)) %>% 
+  as.data.frame()
+```
+
+## Methylation
+
+```{r}
+methylation <- read_tsv("methylation_binned.tsv") %>% 
+  mutate(met = log10(methylation)) %>%
+  filter(!is.infinite(met)) %>% 
+  select(chr, pos, met) %>% 
+  as.data.frame()
+```
+
+
+## Plot
+
+```{r}
+## select segments
+seg.name <- chromosome_segments$chrom
+db       <- segAnglePo(chromosome_segments, seg=seg.name)
+
+colors   <- rainbow(length(seg.name), alpha=1)
+pdffile  <- "Ph_genome.pdf"
+pdf(pdffile, 8, 8)
+par(mar=c(2, 2, 2, 2))
+plot(c(1,800), c(1,800), type="n", axes=FALSE, xlab="", ylab="", main="")
+
+circos(R=400, type="chr", cir=db, print.chr.lab=TRUE, W=4, scale=TRUE, col = "black")
+circos(R=390, cir=db, W=10, mapping=ns, type="b3", B=FALSE, col="black", lwd=1)
+circos(R=350, cir=db, W=40, mapping=methylation, col.v= 3, type="b", B=FALSE, col=colors[1], lwd=0.2, scale=TRUE)
+circos(R=310, cir=db, W=40, mapping=gc_track_10kb, col.v= 3, type="l", B=FALSE, col=colors[2], lwd=0.1, scale=TRUE)
+circos(R=270, cir=db, W=40, mapping=gene_density, col.v= 3, type="b", B=FALSE, col=colors[3], lwd=0.2, scale=TRUE)
+circos(R=230, cir=db, W=40, mapping=TE_density, col.v= 3, type="ls", B=FALSE, col=colors[4], lwd=0.1, scale=TRUE)
+circos(R=150, cir=db, W=80, mapping=pi, col.v= 4, type="b", B=FALSE, col=colors[5], lwd=0.2, scale=TRUE)
+
+dev.off()
+```
+
+
+
+

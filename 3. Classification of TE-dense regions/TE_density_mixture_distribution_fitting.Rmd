@@ -1,0 +1,305 @@
+---
+title: "TE density HMM"
+author: "Zexuan Zhao"
+date: "2023-06-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(depmixS4)
+library(betareg)
+library(parallel)
+library(tidyverse)
+
+win_size <- 200 * 1000
+TE_density_file <- "~/Projects/W2A_analysis/archive/data/TE_density.tsv"
+```
+
+## Data preparation
+
+```{r}
+TE_density <- read_tsv(TE_density_file)
+```
+
+## Likelihood ratio test of number of states
+
+### Normal
+
+```{r}
+cal_llikelihood_uni_normal <- function(parameters, x){
+  if(any(parameters < 0)){
+    return(-Inf)
+  }
+  x %>% 
+    dnorm(mean = parameters["mu"],
+          sd = parameters["sd"],
+          log = TRUE) %>% 
+    sum()
+}
+
+initial_uni_normal <- c(mu = 0, sd = 1)
+
+opt_uni_normal <- optim(
+  method = "SANN",
+  par = initial_uni_normal,
+  fn = cal_llikelihood_uni_normal,
+  x = TE_density$p,
+  control = list(fnscale = -1)
+)
+
+MLE_uni_normal <- opt_uni_normal$par
+llikelihood_uni_normal <- cal_llikelihood_uni_normal(MLE_uni_normal, TE_density$p)
+llikelihood_uni_normal
+```
+
+### Expoential
+
+```{r}
+cal_llikelihood_uni_expo <- function(parameters, x){
+  if(any(parameters < 0)){
+    return(-Inf)
+  }
+  x %>% 
+    dexp(rate = parameters["r"],
+          log = TRUE) %>% 
+    sum()
+}
+
+initial_uni_expo <- c("r" = 1)
+
+opt_uni_expo <- optim(
+  method = "SANN",
+  par = initial_uni_expo,
+  fn = cal_llikelihood_uni_expo,
+  x = TE_density$p,
+  control = list(fnscale = -1)
+)
+
+MLE_uni_expo <- opt_uni_expo$par
+llikelihood_uni_expo <- cal_llikelihood_uni_expo(MLE_uni_expo, TE_density$p)
+llikelihood_uni_expo
+```
+
+
+### Normal normal
+
+```{r}
+cal_llikelihood_bi_normal <- function(parameters, x){
+  if(any(parameters < 0) || parameters["p"] > 1){
+    return(-Inf)
+  }
+  likelihoods <- dnorm(x, mean = parameters["mu1"], sd = parameters["sd1"]) * parameters["p"] +
+    dnorm(x, mean = parameters["mu2"], sd = parameters["sd2"]) * (1 - parameters["p"])
+  return(sum(log(likelihoods)))
+}
+
+initial_bi_normal <- c(mu1 = 0.1, sd1 = 0.2, mu2 = 0.6, sd2 = 0.4, p = 0.5)
+
+opt_bi_normal <- optim(
+  method = "SANN",
+  par = initial_bi_normal,
+  fn = cal_llikelihood_bi_normal,
+  x = TE_density$p,
+  control = list(fnscale = -1)
+)
+
+MLE_bi_normal <- opt_bi_normal$par
+llikelihood_bi_normal <- cal_llikelihood_bi_normal(MLE_bi_normal, TE_density$p)
+llikelihood_bi_normal
+```
+
+### Expoential expoential
+
+```{r}
+cal_llikelihood_bi_expo <- function(parameters, x){
+  if(any(parameters < 0) || parameters["p"] > 1){
+    return(-Inf)
+  }
+  likelihoods <- dexp(x, rate = parameters["r1"]) * parameters["p"] +
+    dexp(x, rate = parameters["r2"]) * (1 - parameters["p"])
+  return(sum(log(likelihoods)))
+}
+
+initial_bi_expo <- c("r1" = 0.1, "r2" = 1, "p" = 0.5)
+
+opt_bi_expo <- optim(
+  method = "SANN",
+  par = initial_bi_expo,
+  fn = cal_llikelihood_bi_expo,
+  x = TE_density$p,
+  control = list(fnscale = -1)
+)
+
+MLE_bi_expo <- opt_bi_expo$par
+llikelihood_bi_expo <- cal_llikelihood_bi_expo(MLE_bi_expo, TE_density$p)
+llikelihood_bi_expo
+```
+
+### Expoential normal
+
+```{r}
+cal_llikelihood_expo_normal <- function(parameters, x){
+  if(any(parameters < 0) || parameters["p"] > 1){
+    return(-Inf)
+  }
+  likelihoods <-dnorm(x, mean = parameters["mu"], sd = parameters["sd"]) * parameters["p"] +
+    dexp(x, rate = parameters["r"]) * (1 - parameters["p"])
+  return(sum(log(likelihoods)))
+}
+
+initial_expo_normal <- c("mu" = 0.6, "sd" = 0.3, "r" = 10, "p" = 0.5)
+
+opt_expo_normal <- optim(
+  method = "SANN",
+  par = initial_expo_normal,
+  fn = cal_llikelihood_expo_normal,
+  x = TE_density$p,
+  control = list(fnscale = -1)
+)
+
+MLE_expo_normal <- opt_expo_normal$par
+llikelihood_expo_normal <- cal_llikelihood_expo_normal(MLE_expo_normal, TE_density$p)
+llikelihood_expo_normal
+```
+
+### Beta distribution
+
+
+```{r}
+p_modified <- TE_density %>% pull(p)
+p_modified[p_modified == 0] <- 1/win_size
+p_modified[p_modified == 1] <- 1-1/win_size
+```
+
+
+## Beta
+
+```{r}
+beta <- betamix(p_modified ~ 1 | 1, data = tibble(p = p_modified), k = 1)
+beta_ll <- beta$flexmix@logLik
+beta_ll
+beta_mu <- plogis(coef(beta)[1])
+beta_phi <- exp(coef(beta)[2])
+beta_a <- beta_mu * beta_phi
+beta_b <- (1 - beta_mu) * beta_phi
+MLE_beta <- c("alpha" = beta_a[1] %>% unname(), "beta" = beta_b[1] %>% unname())
+```
+
+### Beta beta
+
+```{r}
+beta_beta <- betamix(p_modified ~ 1 | 1, data = tibble(p = p_modified), k = 2)
+beta_beta_ll <- beta_beta$flexmix@logLik
+beta_beta_ll
+beta_beta_mu <- plogis(coef(beta_beta)[,1])
+beta_beta_phi <- exp(coef(beta_beta)[,2])
+beta_beta_a <- beta_beta_mu * beta_beta_phi
+beta_beta_b <- (1 - beta_beta_mu) * beta_beta_phi
+beta_beta_cluster <- clusters(beta_beta)
+MLE_beta_beta <- c("alpha1" = beta_beta_a[1] %>% unname(), "beta1" = beta_beta_b[1] %>% unname(),
+                   "alpha2" = beta_beta_a[2] %>% unname(), "beta2" = beta_beta_b[2] %>% unname(),
+                   "p" = sum(beta_beta_cluster == 1)/length(beta_beta_cluster))
+```
+
+### Beta beta beta
+
+```{r}
+beta_beta_beta <- betamix(p_modified ~ 1 | 1, data = tibble(p = p_modified), k = 3)
+beta_beta_beta_ll <- beta_beta_beta$flexmix@logLik
+beta_beta_beta_ll
+beta_beta_beta_mu <- plogis(coef(beta_beta_beta)[,1])
+beta_beta_beta_phi <- exp(coef(beta_beta_beta)[,2])
+beta_beta_beta_a <- beta_beta_beta_mu * beta_beta_beta_phi
+beta_beta_beta_b <- (1 - beta_beta_beta_mu) * beta_beta_beta_phi
+beta_beta_beta_cluster <- clusters(beta_beta_beta)
+
+MLE_beta_beta_beta <- c("alpha1" = beta_beta_beta_a[1] %>% unname(), "beta1" = beta_beta_beta_b[1] %>% unname(),
+                        "alpha2" = beta_beta_beta_a[2] %>% unname(), "beta2" = beta_beta_beta_b[2] %>% unname(),
+                        "alpha3" = beta_beta_beta_a[3] %>% unname(), "beta3" = beta_beta_beta_b[3] %>% unname(),
+                        "p1" = sum(beta_beta_cluster == 1)/length(beta_beta_cluster),
+                        "p2" = sum(beta_beta_cluster == 2)/length(beta_beta_cluster))
+```
+
+## Visualization
+
+```{r}
+png(filename="TE density bimodal fitting.png", width = 21, height = 29, unit = "cm", res = 600)
+par(mfrow= c(4,2), mar = rep(3, 4))
+# Normal
+hist(TE_density$p, probability = TRUE, breaks = 50, main = paste0("Normal"," ", "(ll=", llikelihood_uni_normal, ")"), xlab = "p")
+x <- seq(0,1, length.out = 100)
+lines(x, exp(sapply(x, cal_llikelihood_uni_normal, parameters = MLE_uni_normal)), col = "red", lwd = 3, lty = 2)
+# Expoential
+hist(TE_density$p, probability = TRUE, breaks = 50, main = paste0("Expoential"," ", "(ll=", llikelihood_uni_expo, ")"), xlab = "p")
+x <- seq(0,1, length.out = 100)
+lines(x, exp(sapply(x, cal_llikelihood_uni_expo, parameters = MLE_uni_expo)), col = "red", lwd = 3, lty = 2)
+# Normal normal
+hist(TE_density$p, probability = TRUE, breaks = 50, main = paste0("Normal+normal"," ", "(ll=", llikelihood_bi_normal, ")"), xlab = "p")
+x <- seq(0,1, length.out = 100)
+lines(x, exp(sapply(x, cal_llikelihood_bi_normal, parameters = MLE_bi_normal)), col = "red", lwd = 3, lty = 2)
+# Exponential exponential
+hist(TE_density$p, probability = TRUE, breaks = 50, main = paste0("Exponential+exponential"," ", "(ll=", llikelihood_bi_expo, ")"), xlab = "p")
+x <- seq(0,1, length.out = 100)
+lines(x, exp(sapply(x, cal_llikelihood_bi_expo, parameters = MLE_bi_expo)), col = "red", lwd = 3, lty = 2)
+# Exponential normal
+hist(TE_density$p, probability = TRUE, breaks = 50, main = paste0("Exponential+normal"," ", "(ll=", llikelihood_expo_normal, ")"), xlab = "p")
+x <- seq(0,1, length.out = 100)
+lines(x, exp(sapply(x, cal_llikelihood_expo_normal, parameters = MLE_expo_normal)), col = "red", lwd = 3, lty = 2)
+# Beta
+cal_llikelihood_beta <- function(parameters, x){
+  if(any(parameters < 0)){
+    return(-Inf)
+  }
+  likelihood <- dbeta(x, shape1 = parameters["alpha"], shape2 = parameters["beta"])
+  return(sum(log(likelihood)))
+}
+hist(TE_density$p, probability = TRUE, breaks = 50, main = paste0("Beta"," ", "(ll=", beta_ll, ")"), xlab = "p")
+x <- seq(0,1, length.out = 100)
+lines(x, exp(sapply(x, cal_llikelihood_beta, parameters = MLE_beta)), col = "red", lwd = 3, lty = 2)
+# Beta beta
+cal_llikelihood_beta_beta <- function(parameters, x){
+  if(any(parameters < 0) || parameters["p"] > 1){
+    return(-Inf)
+  }
+  likelihood <- dbeta(x, shape1 = parameters["alpha1"], shape2 = parameters["beta1"]) *  parameters["p"] +
+    dbeta(x, shape1 = parameters["alpha2"], shape2 = parameters["beta2"]) *  (1-parameters["p"])
+  return(sum(log(likelihood)))
+}
+hist(TE_density$p, probability = TRUE, breaks = 50, main = paste0("Beta+beta"," ", "(ll=", beta_beta_ll, ")"), xlab = "p")
+x <- seq(0.01,0.99,0.01)
+lines(x, exp(sapply(x, cal_llikelihood_beta_beta, parameters = MLE_beta_beta)), col = "red", lwd = 3, lty = 2)
+# Beta beta beta
+cal_llikelihood_beta_beta_beta <- function(parameters, x){
+  if(any(parameters < 0)){
+    return(-Inf)
+  } 
+  if (parameters["p1"] > 1 || parameters["p2"] > 1){
+    return(-Inf)
+  }
+  likelihood <- dbeta(x, shape1 = parameters["alpha1"], shape2 = parameters["beta1"]) *  parameters["p1"] +
+    dbeta(x, shape1 = parameters["alpha2"], shape2 = parameters["beta2"]) *  parameters["p2"] +
+    dbeta(x, shape1 = parameters["alpha3"], shape2 = parameters["beta3"]) *  (1 - parameters["p1"] - parameters["p2"])
+  return(sum(log(likelihood)))
+}
+hist(TE_density$p, probability = TRUE, breaks = 50, main = paste0("Beta+beta+beta"," ", "(ll=", beta_beta_beta_ll, ")"), xlab = "p")
+x <- seq(0.01,0.99,0.01)
+tryCatch(lines(x, exp(sapply(x, cal_llikelihood_beta_beta_beta, parameters = MLE_beta_beta_beta)), col = "red", lwd = 3, lty = 2),
+         error = function(error_message) {
+            message("Fail to estimate the MLE")
+            message("And below is the error message from R:")
+            message(error_message)
+            lines(x, exp(sapply(x, cal_llikelihood_beta_beta, parameters = MLE_beta_beta)), col = "red", lwd = 3, lty = 2)
+            return(NA)
+        })
+dev.off()
+```
+
+### Extract mean and median from beta beta model
+
+```{r}
+# mean
+beta_beta_a/(beta_beta_a + beta_beta_b)
+# median
+(beta_beta_a-1/3)/(beta_beta_a + beta_beta_b -2/3)
+```

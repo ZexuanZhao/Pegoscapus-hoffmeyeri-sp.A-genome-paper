@@ -1,0 +1,107 @@
+---
+title: "Calculate TE density"
+author: "Zexuan Zhao"
+date: "2023-06-06"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(biomartr)
+library(GenomicRanges)
+library(Biostrings)
+library(parallel)
+library(tidyverse)
+
+# Input size
+TE_annotation_file <- "../data/v4.W2A.TE_annotation.TEanno.gff3"
+genome_file <- "../data/v4.1.W2A_genome_assembly.fasta"
+out_file <- "W2A_TE_density.tsv"
+
+# Window size
+win_size <- 200 * 1000 
+```
+
+## 1. Read in annotation and data cleaning
+
+```{r}
+# Read in gff file
+TE_annotation <- read_gff(TE_annotation_file) %>% 
+  filter(str_detect(attribute, "Method=homology")) %>% 
+  mutate(strand = "+") %>% # Put all TE on + strand, so that overlapping TEs can be merged
+  filter(str_detect(seqid, "chr")) # Filter non-chromosomal TEs
+# Convert to gr format
+TE_annotation_gr <- makeGRangesFromDataFrame(TE_annotation) %>% 
+  GenomicRanges::reduce()# Merge overlapping TE regions
+```
+
+Total base pairs:
+
+```{r}
+TE_annotation_gr %>% width() %>% sum()
+```
+
+## 2. Add genome info to annotation
+
+```{r}
+genome <- readDNAStringSet(genome_file)
+nuclear <- genome[str_detect(names(genome), "chr")]
+genome_info <- GenomeInfoDb::Seqinfo(seqnames = names(nuclear),
+                                     seqlengths = width(nuclear),
+                                     isCircular = NA,
+                                     genome = NA)
+seqinfo(TE_annotation_gr) <- genome_info
+```
+
+## 3. Calculate TE density
+
+```{r}
+calculate_density <- function(gr, win_size) {
+  # Singular function for mclapply
+  # Calculate proportion of bps in window overlapped with gr
+  # Return a data frame
+  cal_overlap <- function(window, gr){
+    overlap <- GenomicRanges::intersect(gr, window)
+    n_overlaps <- overlap %>% width() %>% sum()
+    return(tibble(chr = as.character(window@seqnames),
+                  pos = mid(window),
+                  n = n_overlaps))
+  }
+  
+  # 1. Make windows
+  # The last window of each chromosome is dropped due to insufficient size
+  windows <- tileGenome(gr@seqinfo, 
+                        tilewidth = win_size, 
+                        cut.last.tile.in.chrom = TRUE)
+  strand(windows) <- "+"
+  windows <- windows[width(windows) == win_size]
+  
+  # Run cal_overlap
+  tb <- mclapply(windows%>% split(), cal_overlap, gr = gr, mc.cores = 8)
+  # Merge result and return
+  result <- do.call(bind_rows, tb)
+  result
+}
+```
+
+Run:
+
+```{r eval = TRUE}
+## Call calculate_proportions
+TE_density <- calculate_density(TE_annotation_gr, win_size) %>% 
+  mutate(p = n / win_size)
+write_tsv(TE_density, out_file)
+```
+
+# 4. Histogram
+
+```{r}
+TE_density %>% 
+  ggplot(aes(x = p)) +
+    geom_histogram(binwidth = 0.01) +
+    theme_classic() +
+    xlab("TE density (%)")
+
+ggsave("../figures/TE density histogram.png")
+```
+

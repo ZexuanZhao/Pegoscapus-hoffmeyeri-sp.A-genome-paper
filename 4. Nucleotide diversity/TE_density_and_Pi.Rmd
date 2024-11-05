@@ -1,0 +1,329 @@
+---
+title: "TE density and Pi"
+author: "Zexuan Zhao"
+date: "2023-07-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggpubr)
+library(scales)
+library(tidyverse)
+```
+
+## Data preparation
+
+```{r}
+before_correction_pi <- read_tsv("~/Projects/W2A_analysis/archive/data/vcftools_pi.txt") %>%
+  mutate(pos = round((BIN_START + BIN_END)/2)) %>% 
+  dplyr::select(chr = CHROM, pos, pi = PI) %>% 
+  mutate(correction = "before") %>% 
+  filter(str_detect(chr, "chr"))
+
+after_correction_pi <- read_tsv("~/Projects/W2A_analysis/archive/data/combined_pi.txt") %>%
+  mutate(pos = round((window_pos_1 + window_pos_2)/2)) %>% 
+  dplyr::select(chr = chromosome, pos, pi = avg_pi, no_sites) %>% 
+  mutate(correction = "after") %>% 
+  filter(str_detect(chr, "chr"))
+
+TE_density_classified <- read_tsv("~/Projects/W2A_analysis/archive/data/TE_density_classified.tsv") %>% 
+  mutate(state = factor(state, levels = c("background", "TE_dense")))
+
+data <- bind_rows(TE_density_classified %>% left_join(before_correction_pi),
+                  TE_density_classified %>% left_join(after_correction_pi)) %>% 
+  mutate(state = ifelse(state == "TE_dense", "TE-rich regions", "Other regions"))
+
+data2 <- data %>% 
+  mutate(state = factor(state, levels = c("Other regions", "TE-rich regions"))) %>% 
+  mutate(correction = ifelse(correction == "before", "Before correction", "After correction")) %>% 
+  mutate(correction = factor(correction, levels = c("Before correction", "After correction")))
+
+chr_lengths <- read_tsv("~/Projects/W2A_analysis/archive/data/v4.1.W2A_genome_assembly.fasta.fai",
+                        col_names = c("chr","length","bits","spacer1","spacer2")) %>% 
+  dplyr::select(chr, length) %>% 
+  filter(str_detect(chr, "chr"))
+```
+
+## Summary
+
+```{r}
+data %>% 
+  group_by(state, correction) %>% 
+  summarize(mean_pi = mean(pi),
+            median_pi = median(pi))
+```
+
+## QC: no_sites between TE-dense and background
+
+```{r}
+data%>% 
+  ggplot(aes(x = state, y = no_sites)) +
+    geom_boxplot()
+
+lm(pi~1+no_sites+p, data = after_correction_pi_annot) %>% summary()
+lm(pi~1+no_sites+state, data = after_correction_pi_annot) %>% summary()
+```
+
+## Correlation between Pi before and after correction
+
+```{r}
+p1 <- data2 %>% 
+  mutate(id = paste(chr, pos, sep = "_")) %>% 
+  ggplot(aes(x = correction, y = pi, color = state)) +
+  geom_boxplot() +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                  labels = trans_format("log10", math_format(10^.x))) +
+  facet_wrap(~state, ncol = 2) +
+  theme_classic2() +
+  geom_line(aes(group=id), width=0.01, alpha = 0.15)+
+  scale_color_manual(values = c("TE-rich regions" = "#f37401", "Other regions" = "#a6a6a6")) +
+  geom_jitter(aes(group=id), width=0.02, alpha = 0.1) +
+  theme(legend.position = "none") +
+  guides(color = guide_legend(title="Region")) +
+  xlab("") +
+  ylab("Pi")
+```
+
+
+
+```{r}
+p2 <- data %>% 
+  pivot_wider(names_from = correction, values_from = pi, id_cols = c(chr, pos, state)) %>% 
+    ggplot(aes(x = before, y = after, color = state)) +
+      geom_point() +
+      scale_color_manual(values = c("TE-rich regions" = "#f37401", "Other regions" = "#a6a6a6"))+
+      geom_abline(slope=1, intercept = 0, color = "red", linetype="dashed") +
+      scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                  labels = trans_format("log10", math_format(10^.x))) +
+      scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                  labels = trans_format("log10", math_format(10^.x))) +
+      theme_bw() +
+      guides(color = guide_legend(title="Region")) +
+      xlab("Pi before correction") +
+      ylab("Pi after correction")
+```
+
+```{r}
+p <- ggarrange(p1, p2,
+          nrow = 2,
+          common.legend = TRUE,
+          legend="bottom")
+ggsave("comparison of Pi before and after correction.png", 
+       plot = p,
+       width = 210, height = 290, units = "mm")
+```
+
+
+## Plot TE density and Pi on chromosomes
+
+```{r}
+pos2cumulative_pos <- function(chromosome, position, chr_lengths){
+  chr_lengths_cumulative <- chr_lengths %>% 
+    mutate(total=cumsum(length)-length) %>%
+    dplyr::select(-length)
+  tibble(chr = chromosome,
+         pos = position) %>% 
+    left_join(chr_lengths_cumulative) %>% 
+    mutate(cumulative_pos = pos + total) %>% 
+    pull(cumulative_pos)
+}
+
+plot_along_genome_scaffold <- function(data, chr_lengths){
+  axisdf <- chr_lengths %>% 
+    mutate(total = cumsum(length) - length) %>%
+    mutate(center = total + length/2)
+  data %>% 
+    ggplot(aes(x = cumulative_pos)) +
+      scale_color_manual(values = rep(c("grey", "skyblue"), nrow(chr_lengths))) +
+      scale_x_continuous(label = axisdf$chr, breaks= axisdf$center) +
+      theme_bw() +
+      theme(legend.position="none",
+            panel.border = element_blank(),
+            panel.grid.major.x = element_blank(),
+            panel.grid.minor.x = element_blank())
+}
+```
+
+
+```{r}
+p1 <- data %>% 
+  filter(correction == "after") %>% 
+  mutate(cumulative_pos = pos2cumulative_pos(chr, pos, chr_lengths)) %>% 
+  plot_along_genome_scaffold(chr_lengths = chr_lengths) +
+    geom_point(aes(y = p, color = as.factor(chr),  alpha = 0.8), size=1.3) +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())+
+    xlab("") +
+    ylab("TE density (%)")
+
+p2 <- data %>% 
+  filter(correction == "after") %>% 
+  mutate(cumulative_pos = pos2cumulative_pos(chr, pos, chr_lengths)) %>% 
+  plot_along_genome_scaffold(chr_lengths = chr_lengths) +
+    geom_point(aes(y = pi, color = as.factor(chr),  alpha = 0.8), size=1.3) +
+    geom_tile(aes(y = 10^-5, fill = state), height = 0.1, alpha = 0.7) + 
+    scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                  labels = trans_format("log10", math_format(10^.x))) +
+    scale_fill_manual(values = c("TE_dense" = "#DDD5F3", "background" = "#a6a6a6")) +
+    ylab("Pi") +
+    xlab("Chromosome")
+ggarrange(p1, p2, 
+          ncol = 1, nrow = 2,
+          heights = c(1, 1))
+ggsave("../figures/TE_density_and_Pi_combined.png", width = 210, height = 120, units = "mm")
+```
+
+## TE density and classification
+```{r}
+data %>% 
+  filter(correction == "after") %>% 
+  mutate(cumulative_pos = pos2cumulative_pos(chr, pos, chr_lengths)) %>% 
+  plot_along_genome_scaffold(chr_lengths = chr_lengths) +
+    geom_point(aes(y = p, color = as.factor(chr),  alpha = 0.8), size=1.3) +
+    geom_tile(aes(y = -0.05, fill = state), height = 0.05, alpha = 0.7) + 
+    #theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())+
+    scale_fill_manual(values = c("TE_dense" = "#DDD5F3", "background" = "#a6a6a6")) +
+    xlab("Chromosome") +
+    ylab("TE density (%)")
+ggsave("../figures/TE_density_and_classification.png", width = 210, height = 50, units = "mm")
+```
+
+
+## Relationships between TE density and Pi
+
+### Significance within state
+
+```{r}
+parameters <- list(
+  type = c("All_site", "Variant_only", "Combined"),
+  region = c("TE-dense", "Background"),
+  method = c("spearman", "kendall")
+)
+
+parameters_tb <- do.call(expand.grid, list(parameters, stringsAsFactors = FALSE))
+
+correlation_test <- tibble()
+
+for (i in 1:nrow(parameters_tb)){
+  s <- parameters_tb[i, "type"]
+  r <- parameters_tb[i, "region"]
+  m <- parameters_tb[i, "method"]
+  test <- cor.test(x = data %>% filter(type == s & state == r) %>% pull(p), 
+                   y = data %>% filter(type == s & state == r) %>% pull(pi), 
+                   method = m)
+  correlation_test <- correlation_test %>% 
+    bind_rows(tibble(type = s,
+                     region = r,
+                     method = m,
+                     statistic = test$statistic,
+                     estimate = test$estimate,
+                     pval = test$p.value))
+}
+correlation_test %>% 
+  write_tsv("../data/corretlation test pi and p.tsv")
+```
+
+
+### Plot variant-only version
+
+```{r}
+comparison_between_state <- compare_means(pi~state, data = data %>% filter(type == "Variant_only"))
+data %>% 
+  filter(type == "Variant_only") %>%
+  ggplot(aes(x = p, y = pi, color = state)) +
+    geom_point(alpha = 0.2) +
+    geom_smooth(aes(linetype = state), alpha = 0, method = "lm", se = FALSE) +
+    stat_pvalue_manual(tibble(group1 = mean(data %>% filter(state == "Background") %>% pull(p)), 
+                              group2 = mean(data %>% filter(state == "TE-dense") %>% pull(p)), 
+                              p = comparison_between_state$p, 
+                              p.format = comparison_between_state$p.format,
+                              p.signif = comparison_between_state$p.signif,
+                              method = comparison_between_state$method,
+                              y.position = 1
+                              ),
+                       bracket.nudge.y = -3.3
+                       ) + 
+    scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                  labels = trans_format("log10", math_format(10^.x))) +
+    theme_classic() +
+    scale_color_manual(values = c("Background"= "#a6a6a6", "TE-dense" = "#DDD5F3")) +
+    scale_linetype_manual(values=c("Background"= 2, "TE-dense" = 4)) +
+    guides(linetype = "none",
+           color = guide_legend(title="Region")) +
+    xlab("TE density (%)") +
+    ylab("Pi by the variant-only pipeline")
+ggsave("../figures/TE_density_and_Pi_correlation_variant_only.png", width = 210, height = 120, units = "mm")
+```
+
+### Plot all-site  version
+
+```{r}
+comparison_between_state <- compare_means(pi~state, data = data %>% filter(type == "All_site"))
+data %>% 
+  filter(type == "All_site") %>%
+  ggplot(aes(x = p, y = pi, color = state)) +
+    geom_point(alpha = 0.2) +
+    geom_smooth(aes(linetype = state), alpha = 0, method = "lm", se = FALSE) +
+    stat_pvalue_manual(tibble(group1 = mean(data %>% filter(state == "Background") %>% pull(p)), 
+                              group2 = mean(data %>% filter(state == "TE-dense") %>% pull(p)), 
+                              p = comparison_between_state$p, 
+                              p.format = comparison_between_state$p.format,
+                              p.signif = comparison_between_state$p.signif,
+                              method = comparison_between_state$method,
+                              y.position = 1
+                              ),
+                       bracket.nudge.y = -3.3
+                       ) + 
+    scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                  labels = trans_format("log10", math_format(10^.x))) +
+    theme_classic() +
+    scale_color_manual(values = c("Background"= "#a6a6a6", "TE-dense" = "#DDD5F3")) +
+    scale_linetype_manual(values=c("Background"= 2, "TE-dense" = 4)) +
+    guides(linetype = "none",
+           color = guide_legend(title="Region")) +
+    xlab("TE density (%)") +
+    ylab("Pi by the all-site pipeline")
+ggsave("../figures/TE_density_and_Pi_correlation_all_site.png", width = 210, height = 120, units = "mm")
+```
+
+### Plot combined version
+
+```{r}
+comparison_between_state <- compare_means(pi~state, data = data %>% filter(type == "Combined"))
+data %>% 
+  filter(type == "Combined") %>%
+  ggplot(aes(x = p, y = pi, color = state)) +
+    geom_point(alpha = 0.2) +
+    geom_smooth(aes(linetype = state), alpha = 0, method = "lm", se = FALSE) +
+    stat_pvalue_manual(tibble(group1 = mean(data %>% filter(state == "Background") %>% pull(p)), 
+                              group2 = mean(data %>% filter(state == "TE-dense") %>% pull(p)), 
+                              p = comparison_between_state$p, 
+                              p.format = comparison_between_state$p.format,
+                              p.signif = comparison_between_state$p.signif,
+                              method = comparison_between_state$method,
+                              y.position = 1
+                              ),
+                       bracket.nudge.y = -3.3
+                       ) + 
+    scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                  labels = trans_format("log10", math_format(10^.x))) +
+    theme_classic() +
+    scale_color_manual(values = c("Background"= "#a6a6a6", "TE-dense" = "#DDD5F3")) +
+    scale_linetype_manual(values=c("Background"= 2, "TE-dense" = 4)) +
+    guides(linetype = "none",
+           color = guide_legend(title="Region")) +
+    xlab("TE density (%)") +
+    ylab("Pi by combining the two pipelines")
+ggsave("../figures/TE_density_and_Pi_correlation_combined.png", width = 210, height = 120, units = "mm")
+```
+
+#### Maybe find the true relationship?
+
+```{r}
+lm(log(pi)~p, data %>% filter(correction == "after")) %>% summary()
+
+lm(log(pi)~state, data %>% filter(correction == "after"))%>% summary()
+```
+
+
+

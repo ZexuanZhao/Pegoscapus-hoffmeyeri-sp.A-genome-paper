@@ -1,0 +1,284 @@
+---
+title: "Pi by regions"
+author: "Zexuan Zhao"
+date: "2023-07-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggh4x)
+library(ggpubr)
+library(scales)
+library(tidyverse)
+```
+
+## Load data
+
+```{r}
+files <- list.files("~/Projects/W2A_analysis/archive/data/", full.names = TRUE)
+pi_files <- files[str_detect(files, "pixy_pi\\..+\\..+\\.txt")]
+gene_annotation <- pi_files %>% 
+  str_extract("(exon|intron|intergenic)")
+TE_annotation <- pi_files %>% 
+  str_extract("(TE|non_TE)")
+
+d <- tibble()
+for(i in 1:length(pi_files)){
+  tb <- read_tsv(pi_files[i]) %>%
+    mutate(pos = round((window_pos_1 + window_pos_2)/2)) %>% 
+    dplyr::select(chr = chromosome, pos, pi = avg_pi, no_sites) %>% 
+    filter(str_detect(chr, "chr")) %>% 
+    mutate(g = gene_annotation[i], t = TE_annotation[i])
+  d <- d %>% 
+    bind_rows(tb)
+}
+```
+
+```{r}
+chr_lengths <- read_tsv("~/Projects/W2A_analysis/archive/data/v4.1.W2A_genome_assembly.fasta.fai",
+                        col_names = c("chr","length","bits","spacer1","spacer2")) %>% 
+  dplyr::select(chr, length) %>% 
+  filter(str_detect(chr, "chr"))
+```
+
+
+
+```{r}
+TE_density_classified <- read_tsv("~/Projects/W2A_analysis/archive/data/TE_density_classified.tsv") %>% 
+  mutate(state = ifelse(state =="TE_dense","TE-dense", state)) %>% 
+  mutate(state = factor(state, levels = c("background", "TE-dense"))) %>% 
+  select(-n)
+pi <- d %>% 
+  left_join(TE_density_classified) %>% 
+  filter(!is.na(state)) %>% 
+  mutate(g = ifelse(g == "intergenic", "intergene", g)) %>% 
+  mutate(label = paste(g, t, sep = "_")) %>% 
+  filter(!is.na(pi)) %>% 
+  select(chr, pos, state, g, t, label, pi, no_sites) %>% 
+  filter(!(g == "exon" & t == "TE"))
+
+pi %>% 
+  ggplot(aes(x = no_sites, fill = label))+
+    geom_density()
+```
+
+
+```{r}
+min_pi_transform <- min(pi$pi[pi$pi != 0])/10
+strip <- strip_themed(background_x = elem_list_rect(fill = c("#a6a6a6", "#f37401")))
+p_Pi <- pi %>% 
+  mutate(pi = ifelse(pi == 0, min_pi_transform, pi)) %>% 
+  ggplot(aes(x = g, y = pi, fill = t, shape = t)) +
+    geom_boxplot() +
+    geom_hline(yintercept = min_pi_transform, linetype = "dashed")+
+    stat_summary(fun = median, geom = "point", position = position_dodge(0.9))+
+    facet_wrap2(~state, strip = strip)+
+    theme_bw() +
+    scale_y_continuous(trans = 'log10',
+                       breaks = trans_breaks('log10', function(x) 10^x),
+                       labels = trans_format('log10', math_format(10^.x))) +
+    guides(fill = guide_legend(title="TE annotation"),
+           shape = guide_legend(title="TE annotation")) +
+    xlab("Genetic feature") +
+    ylab("Pi")
+
+
+p_Pi_n10000 <- pi %>% 
+  filter(no_sites>10000) %>% 
+  mutate(pi = ifelse(pi == 0, min_pi_transform, pi)) %>% 
+  ggplot(aes(x = g, y = pi, fill = t, shape = t)) +
+    geom_boxplot() +
+    geom_hline(yintercept = min_pi_transform, linetype = "dashed")+
+    stat_summary(fun = median, geom = "point", position = position_dodge(0.9))+
+    facet_wrap2(~state, strip = strip)+
+    theme_bw() +
+    scale_y_continuous(trans = 'log10',
+                       breaks = trans_breaks('log10', function(x) 10^x),
+                       labels = trans_format('log10', math_format(10^.x))) +
+    guides(fill = guide_legend(title="TE annotation"),
+           shape = guide_legend(title="TE annotation")) +
+    xlab("Genetic feature") +
+    ylab("Pi")
+
+p_Pi_n3000 <- pi %>% 
+  filter(no_sites>3000) %>% 
+  mutate(pi = ifelse(pi == 0, min_pi_transform, pi)) %>% 
+  ggplot(aes(x = g, y = pi, fill = t, shape = t)) +
+    geom_boxplot() +
+    geom_hline(yintercept = min_pi_transform, linetype = "dashed")+
+    stat_summary(fun = median, geom = "point", position = position_dodge(0.9))+
+    facet_wrap2(~state, strip = strip)+
+    theme_bw() +
+    scale_y_continuous(trans = 'log10',
+                       breaks = trans_breaks('log10', function(x) 10^x),
+                       labels = trans_format('log10', math_format(10^.x))) +
+    guides(fill = guide_legend(title="TE annotation"),
+           shape = guide_legend(title="TE annotation")) +
+    xlab("Genetic feature") +
+    ylab("Pi")
+```
+
+
+```{r}
+p1 <- pi %>% 
+  mutate(state = as.character(state)) %>% 
+  mutate(state = ifelse(state == "TE-dense", "TE-rich regions", state)) %>% 
+  mutate(state = ifelse(state == "background", "Other regions", state)) %>% 
+  mutate(g = ifelse(g == "exon", "Exon", g)) %>% 
+  mutate(g = ifelse(g == "intergene", "Intergene", g)) %>% 
+  mutate(g = ifelse(g == "intron", "Intron", g)) %>% 
+  mutate(t = ifelse(t == "non_TE", "Non-TE", t)) %>% 
+  mutate(t = ifelse(t == "TE", "TE", t)) %>% 
+  filter(g == "Exon" & t == "Non-TE") %>% 
+  ggplot(aes(x = no_sites/1000, y = log10(pi), color = state)) +
+    geom_point(alpha = 0.1) +
+    geom_smooth() +
+    facet_grid(t~g) +
+    theme_bw() +
+    scale_color_manual(values = c("TE-rich regions" = "#f37401", "Other regions" = "#a6a6a6"))+
+    xlab("Effective sequence size (Kbp)") +
+    ylab("Pi on a base-10 log scale") +
+    guides(color = guide_legend(title=""))
+
+p2 <- pi %>% 
+  mutate(state = as.character(state)) %>% 
+  mutate(state = ifelse(state == "TE-dense", "TE-rich regions", state)) %>% 
+  mutate(state = ifelse(state == "background", "Other regions", state)) %>% 
+  mutate(g = ifelse(g == "exon", "Exon", g)) %>% 
+  mutate(g = ifelse(g == "intergene", "Intergene", g)) %>% 
+  mutate(g = ifelse(g == "intron", "Intron", g)) %>% 
+  mutate(t = ifelse(t == "non_TE", "Non-TE", t)) %>% 
+  mutate(t = ifelse(t == "TE", "TE", t)) %>% 
+  filter(g != "Exon" | t != "Non-TE") %>% 
+  ggplot(aes(x = no_sites/1000, y = log10(pi), color = state)) +
+    geom_point(alpha = 0.1) +
+    geom_smooth() +
+    facet_grid(t~g) +
+    theme_bw() +
+    scale_color_manual(values = c("TE-rich regions" = "#f37401", "Other regions" = "#a6a6a6"))+
+    xlab("Effective sequence size (Kbp)") +
+    ylab("Pi on a base-10 log scale") +
+    guides(color = guide_legend(title=""))
+
+ggarrange(p1, p2, 
+          ncol = 2, nrow = 1,
+          heights = c(1, 1),
+          labels = "AUTO",
+          legend = "bottom",
+          common.legend = TRUE)
+
+ggsave("Pi by TE and gene.png", 
+       width = 210, height = 110, units = "mm")
+```
+
+## Violin of both Pi and CpG o/e
+
+
+```{r}
+merged <- pi %>% 
+  mutate(t = ifelse(t == "non_TE", "nonTE", t)) %>% 
+  left_join(readRDS("nucleotide_frequency.rds") %>% 
+              filter(size>3000) %>% 
+              mutate(ratio = o_CG/exp_CG) %>% 
+              select(chr, pos, type, ratio) %>% 
+              separate(col = type, into = c("g", "t"), sep = "_")) %>% 
+  filter(!is.na(ratio)) %>% 
+  mutate(g = ifelse(g == "intergenic", "intergene", g))
+  
+strip <- strip_themed(background_x = elem_list_rect(fill = c("#a6a6a6", "#DDD5F3")))
+
+min_pi_transform <- min(merged$pi[merged$pi != 0])/10
+
+p_Pi <- merged %>% 
+  filter(!(g == "exon" & t == "TE")) %>% 
+  mutate(pi = ifelse(pi == 0, min_pi_transform, pi)) %>% 
+  ggplot(aes(x = g, y = pi, fill = t, shape = t)) +
+    geom_violin(trim = TRUE) +
+    geom_hline(yintercept = min_pi_transform, linetype = "dashed")+
+    stat_summary(fun = median, geom = "point", position = position_dodge(0.9))+
+    facet_wrap2(~state, strip = strip)+
+    theme_bw() +
+    scale_y_continuous(trans = 'log10',
+                       breaks = trans_breaks('log10', function(x) 10^x),
+                       labels = trans_format('log10', math_format(10^.x))) +
+    guides(fill = guide_legend(title="TE annotation"),
+           shape = guide_legend(title="TE annotation")) +
+    xlab("Genetic feature") +
+    ylab("Pi")
+
+p_CpG <- merged %>% 
+  filter(!(g == "exon" & t == "TE")) %>% 
+  ggplot(aes(x = g, y = ratio, fill = t, shape = t)) +
+    geom_violin(trim = TRUE) +
+    stat_summary(fun = median, geom = "point", position = position_dodge(0.9))+
+    facet_wrap2(~state, strip = strip)+
+    theme_bw() +
+    guides(fill = guide_legend(title="TE annotation"),
+           shape = guide_legend(title="TE annotation")) +
+    xlab("Genetic feature") +
+    ylab("CpG o/e")
+
+ggarrange(p_CpG, p_Pi, nrow = 1, common.legend = TRUE, legend="bottom")
+ggsave("../figures/../figures/Pi and CpG by TE and gene.png", 
+       width = 210, height = 120, units = "mm")
+```
+
+
+## Statistics
+
+```{r}
+merged %>% 
+  group_by(state, g, t) %>% 
+  summarize(median_pi = median(pi))
+
+merged %>% 
+  group_by(state, g, t) %>% 
+  summarize(mean_ratio = median(ratio))
+```
+
+```{r}
+merged_relabeled <- merged %>% 
+  mutate(label = paste(state, g, t, sep = "_")) %>% 
+  filter(!str_detect(label,"exon_TE"))
+```
+
+```{r}
+ratio_pairwise_test <- pairwise.wilcox.test(merged_relabeled$ratio, merged_relabeled$label, 
+                     p.adj = "bonf")
+
+ratio_pairwise_test$p.value %>% 
+  as_tibble() %>% 
+  mutate(compare = rownames(ratio_pairwise_test$p.value), .before = 1) %>% 
+  write_tsv("../data/pairwise_test_of_CpG.tsv")
+```
+
+```{r}
+pi_pairwise_test <- pairwise.wilcox.test(merged_relabeled$pi, merged_relabeled$label, 
+                     p.adj = "bonf")
+
+pi_pairwise_test$p.value %>% 
+  as_tibble() %>% 
+  mutate(compare = rownames(pi_pairwise_test$p.value), .before = 1) %>% 
+  write_tsv("../data/pairwise_test_of_Pi.tsv")
+```
+
+```{r}
+pi %>% 
+  mutate(pi = ifelse(pi == 0, min_pi_transform, pi)) %>% 
+  filter(state == "TE-dense") %>% 
+  #mutate(label = paste(chr, label, sep = "_")) %>% 
+  filter(label != "exon_TE") %>%
+  ggplot(aes(x = label, y = pi, fill = chr)) +
+    geom_violin() +
+    scale_y_continuous(trans = "log")
+```
+
+```{r}
+merged %>% 
+  filter(state == "TE-dense" & g == "exon" & t == "nonTE") %>% 
+  ggplot(aes(x = ratio, y = pi)) +
+    geom_point()
+  
+```
+

@@ -1,0 +1,232 @@
+---
+title: "TE density HMM"
+author: "Zexuan Zhao"
+date: "2023-06-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(depmixS4)
+library(betareg)
+library(parallel)
+library(tidyverse)
+
+win_size <- 200 * 1000
+TE_density_file <- "../data/TE_density.tsv"
+fai_file <- "../data/v4.1.W2A_genome_assembly.fasta.fai"
+classification_file <- "../data/TE_density_classified.tsv"
+junction_file <- "../data/junciton.bed" # This bed file can be opened in IGV to view the transitional regions
+```
+
+## Data preparation
+
+```{r}
+TE_density <- read_tsv(TE_density_file)
+```
+
+## HMM fitting
+
+```{r}
+chrs <- TE_density$chr %>% unique()
+## Separate 5 chromosomes and train together
+length_series <- c(sum(TE_density$chr == chrs[1]),
+                   sum(TE_density$chr == chrs[2]),
+                   sum(TE_density$chr == chrs[3]),
+                   sum(TE_density$chr == chrs[4]),
+                   sum(TE_density$chr == chrs[5]))
+# Two states
+n_states <- 2
+# Train
+model <- depmix(p~1, 
+                data = TE_density, 
+                nstates = n_states, 
+                family =  gaussian(),
+                ntimes = length_series)
+fitted <- fit(model, method = "EM", verbose = FALSE)
+```
+
+Transition probabilities
+
+```{r}
+transitions <- c(fitted@transition[[1]]@parameters$coefficients[2], fitted@transition[[2]]@parameters$coefficients[1])
+transitions
+```
+
+Expected region sizes
+
+```{r}
+expected_length <- 1/transitions * win_size
+expected_length
+```
+
+Emission probabilities
+
+```{r}
+emissions <- getpars(fitted)[7:10]
+```
+
+
+## Permutation test
+
+```{r}
+# Suppress convergence message from fit()
+quiet <- function(x) { 
+  sink(tempfile()) 
+  on.exit(sink()) 
+  invisible(force(x)) 
+} 
+# Singular function for permutation
+permute_transition <- function(x){
+  shuffled <- TE_density %>% 
+    mutate(p = sample(p,replace = FALSE))
+  model_permute <- depmix(p ~ 1, 
+                data = shuffled, 
+                nstates = n_states, 
+                family =  gaussian(),
+                ntimes = length_series)
+  fitted_permute <- quiet(fit(model_permute, method = "EM", verbose = FALSE))
+  return(c(fitted_permute@transition[[1]]@parameters$coefficients[2], fitted_permute@transition[[2]]@parameters$coefficients[1]))
+}
+# Run permutation
+p_permuted <- mclapply(1:1000, FUN = permute_transition, mc.cores = 8)
+
+get_from_list <- function(x, l){
+  out <- vector()
+  for (i in 1:length(l)){
+    value <- l[[i]][x]
+    if(is.numeric(value)){
+      out <- c(out, value)
+    }
+  }
+  out
+}
+p1_permuted <- get_from_list(1, p_permuted)
+p2_permuted <- get_from_list(2, p_permuted)
+```
+
+Significance of two transition probabilities
+
+```{r}
+p1_pval <- sum(p1_permuted < transitions[1])/length(p1_permuted)
+p2_pval <- sum(p2_permuted < transitions[2])/length(p2_permuted)
+```
+
+## Summarize and write results
+
+```{r}
+summary(fitted)
+```
+
+
+```{r}
+TE_density_classified <- TE_density %>% 
+  mutate(state = depmixS4::posterior(fitted, type = "global"))
+TE_high_state <- TE_density_classified %>% 
+  group_by(state) %>% 
+  summarize(mean_p = mean(p)) %>% 
+  filter(mean_p == max(mean_p)) %>% 
+  pull(state)
+TE_density_classified %>% 
+  mutate(state = ifelse(state == TE_high_state, "TE_dense", "background")) %>% 
+  write_tsv(classification_file)
+```
+
+
+## Exploratory analysis
+
+```{r}
+chr_lengths <- read_tsv(fai_file,
+                        col_names = c("chr","length","bits","spacer1","spacer2")) %>% 
+  dplyr::select(chr, length) %>% 
+  filter(str_detect(chr, "chr"))
+```
+
+
+### Mean and median density
+
+```{r}
+TE_density_classified %>% 
+  group_by(state) %>% 
+  summarize(n = n(), mean = mean(p), median = median(p))
+```
+
+### Length and number of TE-dense regions:
+
+```{r}
+TE_region <- vector()
+for(c in unique(TE_density_classified$chr)){
+  r <- TE_density_classified %>% 
+    filter(chr == c) %>% 
+    pull(state) %>% 
+    rle()
+  TE_region_in_c <- r$lengths[r$values == "TE_dense"]
+  names(TE_region_in_c) <- rep(c, length(TE_region_in_c))
+  TE_region <- c(TE_region, TE_region_in_c)
+}
+TE_region
+TE_region %>% length()
+```
+
+## Per chromosome summary
+
+```{r}
+TE_density_classified %>% 
+  filter(state == "TE_dense") %>% 
+  group_by(chr) %>% 
+  summarize(n_window = n(), total_size = n_window*0.2) %>% 
+  left_join(chr_lengths) %>% 
+  mutate(length = length/10^6) %>% 
+  mutate(p = total_size/length) %>% 
+  dplyr::select(-length) %>% 
+  group_by(chr) %>% 
+  mutate(n_region = sum(names(TE_region) == chr))
+```
+
+### Transitional region in bed format
+
+```{r}
+junction_region <- tibble() 
+for (i in 1:nrow(TE_density_classified)){
+  if (i == 1){
+    next
+  }
+  if(TE_density_classified$chr[i-1] != TE_density_classified$chr[i]){
+    next
+  }
+  if(TE_density_classified$state[i-1] != TE_density_classified$state[i]){
+    c <- TE_density_classified$chr[i-1]
+    pos_1 <- TE_density_classified$pos[i-1] - 200*1000/2
+    pos_2 <- TE_density_classified$pos[i]   + 200*1000/2
+    tb <- tibble(chr = c,
+               start = pos_1,
+               end = pos_2)
+    junction_region <- junction_region %>% 
+      bind_rows(tb)
+  }
+}
+junction_region$big <- FALSE
+for(i in seq(1, nrow(junction_region), 2)){
+  pos_1 <- junction_region$start[i]
+  pos_2 <- junction_region$end[i+1]
+  if(pos_2 - pos_1 > 10 * 1000 * 1000){
+    junction_region$big[i] <- TRUE
+    junction_region$big[i+1] <- TRUE
+  }
+}
+junction_region <- junction_region %>% filter(big)
+```
+
+```{r}
+junction_bed <- tibble()
+w_size <- 10000
+
+for(i in 1:nrow(junction_region)){
+  junction_bed <- junction_bed %>% 
+    bind_rows(tibble(chr = junction_region$chr[i],
+                     start = seq(from = junction_region$start[i], to = junction_region$end[i] - w_size, by = w_size),
+                     end = seq(from = junction_region$start[i] + w_size, to = junction_region$end[i], by = w_size)))
+}
+
+write_tsv(junction_file, , col_names = FALSE)
+```
