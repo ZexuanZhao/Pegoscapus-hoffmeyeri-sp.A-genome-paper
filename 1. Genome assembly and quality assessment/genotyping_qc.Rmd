@@ -1,0 +1,433 @@
+---
+title: "genotyping_qc"
+author: "Zexuan Zhao"
+date: "2023-04-06"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library("gdsfmt")
+library("SNPRelate")
+library("SeqVarTools")
+library("GenomicRanges")
+library("parallel")
+library("tidyverse")
+
+source("../Utils/plot_along_genome.R")
+
+paths <- list()
+paths$gds <- file.path("")
+paths$faidx <- file.path("")
+paths$genome <- file.path("")
+paths$coverage <- file.path("")
+paths$mapping_quality <- file.path("")
+paths$raw_vcf <- file.path("")
+paths$hifi_cov_tsv <- file.path("")
+
+## Set output file paths
+paths$outdir <- file.path("")
+paths$out_plot <- file.path(paths$outdir, "plot")
+
+## Set parameters
+para <- list()
+para$w_size <- 50*1000 # Sliding window size
+
+## Set cores
+opts <- list()
+opts$threads <- 7
+seqParallelSetup(opts$threads)
+```
+
+```{r}
+genofile <- seqOpen(paths$gds)
+genome <- Biostrings::readDNAStringSet(paths$genome)
+genome_info <- GenomeInfoDb::Seqinfo(seqnames = names(genome)[1:5],
+        seqlengths = width(genome)[1:5],
+        genome="Pegoscapus")
+
+chr_lengths <- read_tsv(paths$faidx,
+                        col_names = c("chr","length","bits","spacer1","spacer2")) %>% 
+  select(chr, length) %>% 
+  filter(str_detect(chr, "chr"))
+variant_id_pos <- seqGetData(genofile, var.name = c("variant.id", "chromosome", "position")) %>% 
+  as_tibble() %>% 
+  select(id = variant.id, chr = chromosome, pos = position) %>% 
+  mutate(id = as.character(id))
+gene_TE_predicted <- read_rds("../gene_TE_density/gene_TE_predicted.rds")
+```
+
+# Assembly coverage
+
+```{r}
+hifi_cov <- read_tsv("paths$hifi_cov_tsv ",
+                     col_names = c("chr", "start", "end", "n_reads", "n_bp_covered", "w_size", "coverage"))
+
+hifi_cov %>% 
+  filter(str_detect(chr, "chr")) %>% 
+    mutate(pos = (start+ end)/2) %>% 
+    mutate(cumulative_pos = pos2cumulative_pos(chr, pos, chr_lengths)) %>% 
+    plot_along_genome_scaffold(chr_lengths) +
+    geom_point(aes(y = n_reads, color = as.factor(chr), alpha = 0.8), size=1.3) +
+    tidyquant::geom_ma(aes(y = n_reads), n = 50) +
+    xlab("Chromosome") +
+    ylab(paste0("Number of HiFi reads mapped in windows")) +
+    ylim(0, 1000)
+
+ggsave(file.path(paths$out_plot, "n_HiFi_mapped.png"))
+```
+
+
+```{r}
+hifi_cov %>% 
+  filter(str_detect(chr, "chr")) %>% 
+    mutate(pos = (start+ end)/2) %>% 
+    mutate(cumulative_pos = pos2cumulative_pos(chr, pos, chr_lengths)) %>% 
+    plot_along_genome_scaffold(chr_lengths) +
+    geom_point(aes(y = coverage, color = as.factor(chr), alpha = 0.8), size=1.3) +
+    tidyquant::geom_ma(aes(y = coverage), n = 50) +
+    xlab("Chromosome") +
+    ylab("HiFi reads coverage in windows") +
+    ylim(0.9, 1)
+
+ggsave(file.path(paths$out_plot, "HiFi_cov.png"))
+```
+
+
+# Mapping quality
+
+## Read coverage
+
+## Coverage of reads 
+
+Read in coverage data
+
+```{r}
+coverage_illumina <- tibble()
+for (sample in seqGetData(genofile, "sample.id")){
+  cov <- read_tsv(file.path(paths$coverage, paste0(sample, "_coverage.txt")),
+                  col_names = c("chr", "start", "end", "n_reads", "n_bp_covered", "w_size", "coverage")) %>% 
+    filter(str_detect(chr, "chr")) %>% 
+    mutate(depth = n_reads*150/n_bp_covered) %>% 
+    mutate(sample = sample)
+  coverage_illumina <- coverage_illumina %>% 
+    bind_rows(cov)
+}
+```
+
+### Per sample depth along chromosomes
+
+```{r}
+for(s in seqGetData(genofile, "sample.id")){
+  p <- coverage_illumina %>% 
+    filter(sample == s) %>% 
+    mutate(pos = (start+ end)/2) %>% 
+    mutate(cumulative_pos = pos2cumulative_pos(chr, pos, chr_lengths)) %>% 
+    plot_along_genome_scaffold(chr_lengths) +
+    geom_point(aes(y = depth, color = as.factor(chr), alpha = 0.8), size=1.3) +
+    tidyquant::geom_ma(aes(y = depth), n = 50) +
+    xlab("Chromosome") +
+    ylab(paste0("Depth", " ", s)) 
+  print(p)
+  ggsave(file.path(paths$out_plot, paste0(s, "_depth.png")))
+}
+```
+
+### Per sample coverage along chromosomes
+
+```{r}
+for(s in seqGetData(genofile, "sample.id")){
+  p <- coverage_illumina %>% 
+    filter(sample == s) %>% 
+    mutate(pos = (start+ end)/2) %>% 
+    mutate(cumulative_pos = pos2cumulative_pos(chr, pos, chr_lengths)) %>% 
+    plot_along_genome_scaffold(chr_lengths) +
+    geom_point(aes(y = coverage, color = as.factor(chr), alpha = 0.8), size=1.3) +
+    tidyquant::geom_ma(aes(y = coverage), n = 50) +
+    xlab("Chromosome") +
+    ylab(paste0("Coverage", " ", s)) 
+  print(p)
+  ggsave(file.path(paths$out_plot, paste0(s, "_coverage.png")))
+}
+```
+
+### Per sample depth distribution
+
+```{r}
+coverage_illumina %>% 
+  ggplot(aes(x = sample, y = depth)) +
+    geom_boxplot() +
+    scale_y_continuous(trans = "log10")
+```
+
+### Per sample coverage distribution
+
+```{r}
+coverage_illumina %>% 
+  ggplot(aes(x = sample, y = coverage)) +
+    geom_boxplot() 
+```
+
+## Quality of mapping
+
+```{r}
+mapping_quality_illumina <- tibble()
+for (sample in seqGetData(genofile, "sample.id")){
+  mq <- read_tsv(file.path(paths$mapping_quality, paste0(sample, ".quality.txt")),
+                  col_names = c("chr", "start", "end", "MQ")) %>% 
+    filter(str_detect(chr, "chr")) %>% 
+    mutate(sample = sample)
+  mapping_quality_illumina <- mapping_quality_illumina %>% 
+    bind_rows(mq)
+}
+```
+
+### Per sample mapping quality along chromosomes
+
+```{r}
+for(s in seqGetData(genofile, "sample.id")){
+  p <- mapping_quality_illumina %>% 
+    filter(sample == s) %>% 
+    mutate(pos = (start+ end)/2) %>% 
+    mutate(cumulative_pos = pos2cumulative_pos(chr, pos, chr_lengths)) %>% 
+    plot_along_genome_scaffold(chr_lengths) +
+    geom_point(aes(y = MQ, color = as.factor(chr), alpha = 0.8), size=1.3) +
+    tidyquant::geom_ma(aes(y = MQ), n = 50) +
+    xlab("Chromosome") +
+    ylab(paste0("Mapping quality", " ", s)) 
+  print(p)
+  ggsave(file.path(paths$out_plot, paste0(s, "_mq.png")))
+}
+```
+
+Which windows are relatively good?
+
+```{r}
+mapping_quality_illumina_hist_df <- mapping_quality_illumina %>% 
+  arrange(MQ) %>% 
+  mutate(cumulative = cumsum(MQ)/sum(MQ))
+ymax <- 11000
+mapping_quality_illumina_hist_df %>% 
+  ggplot(aes(x = MQ)) +
+    geom_histogram() +
+    geom_line(aes(y=cumulative*ymax), col="red", lwd=1)+
+    scale_x_continuous(trans = "exp", breaks=c(58, 58.5, 58.8, 59, 59.5, 60)) +
+    scale_y_continuous(name = 'Number of windows', 
+                       sec.axis = sec_axis(~./ymax, name = "Cumulative percentage of windows [%]"))
+```
+
+Mapping quality versus percentage of positions with secondary mapping
+
+```{r}
+tibble(MQ = seq(58, 60, 0.1)) %>% 
+  mutate(p = (60-MQ)/60*100) %>% 
+  ggplot(aes(x = MQ, y = p)) +
+    geom_line() +
+    ylab("Percentage of positions ")
+```
+
+Use a cutoff of 59.5
+
+```{r}
+for(s in seqGetData(genofile, "sample.id")){
+  p <- mapping_quality_illumina %>% 
+    filter(sample == s) %>% 
+    filter(MQ > 59.5) %>% 
+    mutate(pos = (start+ end)/2) %>% 
+    mutate(cumulative_pos = pos2cumulative_pos(chr, pos, chr_lengths)) %>% 
+    plot_along_genome_scaffold(chr_lengths) +
+    geom_point(aes(y = MQ, color = as.factor(chr), alpha = 0.8), size=1.3) +
+    tidyquant::geom_ma(aes(y = MQ), n = 50) +
+    xlab("Chromosome") +
+    ylab(paste0("Mapping quality", " ", s)) 
+  print(p)
+  ggsave(file.path(paths$out_plot, paste0(s, "_mq_hq.png")))
+}
+```
+
+### Per sample mapping quality distribution
+
+```{r}
+mapping_quality_illumina %>% 
+  ggplot(aes(x = sample, y = MQ)) +
+    geom_boxplot() 
+```
+
+# Genotyping quality
+
+## Number of proposed SNPs along genome
+
+```{r}
+calculate_n <- function(df, win_size) {
+  # Singular util function for mclapply
+  # Calculate number of entries in windows
+  # Return a dataframe
+  
+  cal_average <- function(window, df){
+    chr_name <- seqnames(window) %>% as.character()
+    s <- start(window)
+    e <- end(window)
+    m <- mid(window)
+    df_in_window <- df %>% 
+      filter(chr == chr_name & pos >= s & pos <= e)
+    return(tibble(chr = chr_name,
+                  pos = m,
+                  n = nrow(df_in_window)))
+  }
+  
+  # Make windows
+  # Remove last windows at the end of each chromosome
+  windows <- tileGenome(genome_info, tilewidth = win_size, cut.last.tile.in.chrom = TRUE)
+  strand(windows) <- "+"
+  windows <- windows[width(windows) == win_size]
+  
+  # Calculate
+  tb <- mclapply(windows%>% split(), cal_average, df = df, mc.cores = 8)
+  # Merge result and return
+  result <- do.call(bind_rows, tb)
+  result
+}
+```
+
+
+```{r eval=FALSE}
+proposed_snps_n <- tibble()
+for(s in seqGetData(genofile, "sample.id")){
+  sample_vcf <- read_tsv(file.path(paths$raw_vcf, paste0(s, ".vcf")), 
+                         comment = "#",
+                         col_select = 1:2,
+                         col_names = c("chr", "pos"))
+  sample_vcf_n <- calculate_n(sample_vcf, para$w_size) %>% 
+    mutate(sample = s)
+  proposed_snps_n <- proposed_snps_n %>% 
+    bind_rows(sample_vcf_n)
+}
+saveRDS(proposed_snps_n, "proposed_snps_n.rds")
+```
+
+```{r}
+proposed_snps_n <- read_rds("proposed_snps_n.rds")
+for(s in seqGetData(genofile, "sample.id")){
+  p <- proposed_snps_n %>% 
+    filter(sample == s) %>% 
+    mutate(cumulative_pos = pos2cumulative_pos(chr, pos, chr_lengths)) %>% 
+    plot_along_genome_scaffold(chr_lengths) +
+    geom_point(aes(y = n, color = as.factor(chr), alpha = 0.8), size=1.3) +
+    tidyquant::geom_ma(aes(y = n), n = 50) +
+    xlab("Chromosome") +
+    ylab(paste0("Number of proposed variants", " ", s)) 
+  print(p)
+  ggsave(file.path(paths$out_plot, paste0(s, "_n_proposed.png")))
+}
+```
+
+## Genotyping quality and SNP number along genome
+
+```{r}
+calculate_average <- function(df, win_size) {
+  # Singular util function for mclapply
+  # Calculate average of x in df, and number of x used in calculation
+  # Return a dataframe
+  cal_average <- function(window, df){
+    chr_name <- seqnames(window) %>% as.character()
+    s <- start(window)
+    e <- end(window)
+    m <- mid(window)
+    df_in_window <- df %>% 
+      filter(chr == chr_name & pos >= s & pos <= e)
+    return(tibble(chr = chr_name,
+                  pos = m,
+                  n = nrow(df_in_window),
+                  average = df_in_window$x %>% mean()))
+  }
+  
+  # Make windows
+  # Remove last windows at the end of each chromosome
+  windows <- tileGenome(genome_info, tilewidth = win_size, cut.last.tile.in.chrom = TRUE)
+  strand(windows) <- "+"
+  windows <- windows[width(windows) == win_size]
+  
+  # Calculate
+  tb <- mclapply(windows%>% split(), cal_average, df = df, mc.cores = 8)
+  # Merge result and return
+  result <- do.call(bind_rows, tb)
+  result
+}
+```
+
+```{r eval=FALSE}
+seqResetFilter(genofile)
+annotation_quality <- tibble(id = seqGetData(genofile, "variant.id") %>% as.character(),
+                             qual = seqGetData(genofile, "annotation/qual")) %>% 
+  left_join(variant_id_pos) %>% 
+  select(-id)
+annotation_quality_window <- calculate_average(annotation_quality %>% select(chr, pos, x = qual),
+                                               win_size = para$w_size)
+saveRDS(annotation_quality_window, file.path(paths$outdir, "annotation_quality_window.rds"))
+rm(annotation_quality)
+```
+
+```{r}
+annotation_quality_window <- readRDS(file.path(paths$outdir, "annotation_quality_window.rds"))
+annotation_quality_window %>% 
+ mutate(cumulative_pos = pos2cumulative_pos(chr, pos, chr_lengths)) %>% 
+  plot_along_genome_scaffold(chr_lengths) +
+  geom_point(aes(y = average, color = as.factor(chr), alpha = 0.8), size=1.3) +
+  tidyquant::geom_ma(aes(y = average), n = 50) +
+  xlab("Chromosome") +
+  ylab("Genotype quality")
+
+annotation_quality_window %>% 
+ mutate(cumulative_pos = pos2cumulative_pos(chr, pos, chr_lengths)) %>% 
+  plot_along_genome_scaffold(chr_lengths) +
+  geom_point(aes(y = n, color = as.factor(chr), alpha = 0.8), size=1.3) +
+  tidyquant::geom_ma(aes(y = n), n = 50) +
+  xlab("Chromosome") +
+  ylab("SNP number")
+```
+
+## Genotyping quality and snp number versus TE proportion
+
+```{r}
+annotation_quality_window %>% 
+  mutate(loc = paste0(chr, pos)) %>% 
+  left_join(gene_TE_predicted) %>% 
+  filter(str_detect(loc, "chr")) %>% 
+  filter(!is.na(state)) %>% 
+  ggplot(aes(x = pTE, y = average, col = state, alpha = 0.5)) +
+    geom_point() +
+    xlab("Proportion of TEs") +
+    ylab("Genotyping quality")
+```
+
+```{r}
+annotation_quality_window %>% 
+  mutate(loc = paste0(chr, pos)) %>% 
+  left_join(gene_TE_predicted) %>% 
+  filter(str_detect(loc, "chr")) %>% 
+  filter(!is.na(state)) %>% 
+  ggplot(aes(x = pTE, y = n, col = state, alpha = 0.5)) +
+    geom_point() +
+    xlab("SNP number") +
+    ylab("Genotyping quality")
+```
+
+```{r}
+mapping_quality_illumina_lower_bound <- mapping_quality_illumina %>% 
+  mutate(pos = (start+end)/2) %>% 
+  group_by(chr, pos) %>% 
+  summarize(min_MQ = min(MQ)) %>% 
+  select(chr, pos, min_MQ) %>% 
+  ungroup()
+annotation_quality_window %>% 
+  left_join(mapping_quality_illumina_lower_bound) %>% 
+  mutate(cumulative_pos = pos2cumulative_pos(chr, pos, chr_lengths)) %>% 
+  filter(min_MQ >59.5) %>% 
+  plot_along_genome_scaffold(chr_lengths) +
+  geom_point(aes(y = n, color = as.factor(chr), alpha = 0.8), size=1.3) +
+  #tidyquant::geom_ma(aes(y = n), n = 50) +
+  xlab("Chromosome") +
+  ylab("SNP number in consistantly high MQ windows")
+```
+
+
