@@ -1,0 +1,761 @@
+---
+title: "Gene features"
+author: "Zexuan Zhao"
+date: "2024-02-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(parallel)
+library(randomForest)
+library(coRdon)
+library(biomartr)
+library(Biostrings)
+library(GenomicRanges)
+library(tidyverse)
+
+annotation_file <- "final_functional_genes_annotation.addintron.gff"
+genome_file <- "v4.1.W2A_genome_assembly.fasta"
+
+scientific_10 <- function(x) {
+  parse(text=gsub("e", " %*% 10^", scales::scientific_format()(x)))
+}
+```
+
+
+## Load annotation and separate each gene
+
+
+```{r eval = FALSE}
+annotation <- read_gff(annotation_file) %>% 
+  filter(str_detect(seqid, "chr"))
+
+gene_indices <- which(annotation$type == "gene")
+
+gene_annotation_list <- list()
+for (i in 1:length(gene_indices)){
+  row_begin <- gene_indices[i]
+  row_end <- ifelse(i < length(gene_indices), gene_indices[i+1]-1, nrow(annotation))
+  gene_annotation_list[[i]] <- annotation[row_begin:row_end, ]
+}
+rm(row_begin, row_end, gene_indices, i)
+```
+
+## GC, GC3 and CpG
+
+```{r eval = FALSE}
+genome_seq <- readDNAStringSet(genome_file)
+
+subset_seq <- function(DNAss, gr){
+  ## Subset a DNAstringSet using genomic range with consideration of strandness
+  ## Return a concatenated sequence of DNAstring class
+  s <- strand(gr) %>% as.character() %>% unique()
+  if(length(s) >1){
+    stop("Multiple strands!")
+  }
+  if(s == "+" | s == "*"){
+    return(DNAss[gr] %>% unlist())
+  }
+  if(s == "-"){
+    return(DNAss[gr] %>% unlist() %>% reverseComplement())
+  }
+  stop("Strand error!")
+}
+
+get_nuc_frequencies <- function(seq, prefix){
+  ## Get single and di nucleotide frequency in A seq
+  ## Calculate observed mononucleotide frequency
+  o_mono <- alphabetFrequency(seq, base = TRUE)
+  o_mono <- o_mono[names(o_mono) %in% c("A", "C", "G", "T")]
+  o_mono <- o_mono/sum(o_mono)
+  ## Calculate observed dinucleotide frequency
+  o_di <- dinucleotideFrequency(seq)
+  o_di <- o_di/sum(o_di)
+  names(o_di) <- paste(prefix, "o", names(o_di), sep = "_")
+  ## Calculate expected dinucleotide frequency
+  exp_di <- o_mono %o% o_mono %>% 
+    gdata::unmatrix()
+  names(o_mono) <- paste(prefix, "o", names(o_mono), sep = "_")
+  o_mono <- o_mono %>% t() %>% as.matrix()
+  o_di <- o_di %>% t() %>% as.matrix()
+  names(exp_di) <- str_remove(names(exp_di), ":")
+  names(exp_di) <- paste(prefix, "e", names(exp_di), sep = "_")
+  exp_di <- exp_di %>% t() %>% as.matrix()
+  tb <- as_tibble(o_mono) %>% 
+    bind_cols(as_tibble(o_di)) %>% 
+    bind_cols(as_tibble(exp_di))
+    tb
+}
+
+get_GC3 <- function(cds){
+  third_codon_pos_seq <- cds[seq(3, length(cds), 3)]
+  o_mono <- alphabetFrequency(third_codon_pos_seq, base = TRUE)
+  o_mono <- o_mono[names(o_mono) %in% c("A", "C", "G", "T")]
+  o_mono <- o_mono/sum(o_mono)
+  o_mono[c("G", "C")] %>% sum()
+}
+
+extract_features <- function(gene_tb, genome_seq){
+  ## Get IDs
+  gene_id <- gene_tb %>% 
+    filter(type == "gene") %>% 
+    pull(attribute) %>% 
+    str_extract("ID=[^;]+") %>% 
+    str_remove("ID=")
+  transcript_id <- gene_tb %>% 
+    filter(type == "transcript" | type == "mRNA") %>% 
+    pull(attribute) %>% 
+    str_extract("ID=[^;]+") %>% 
+    str_remove("ID=")
+  
+  ## Get locations
+  chr <- gene_tb$seqid %>% unique()
+  gene_start <- gene_tb %>% 
+    filter(type == "gene") %>% 
+    pull(start)
+  gene_end <- gene_tb %>% 
+    filter(type == "gene") %>% 
+    pull(end)
+  strand <- gene_tb$strand %>% unique()
+  ## Get annotation stats
+  source <- ifelse(sum(str_detect(gene_tb$source, "GeMoMa")) > 1, "homology", "de novo")
+  n_exon <- sum(gene_tb$type == "exon")
+  n_intron <- sum(gene_tb$type == "intron")
+  
+  ## Get protein sequences
+  cds_gr <- gene_tb %>% 
+    filter(type == "CDS") %>% 
+    makeGRangesFromDataFrame()
+  cds_seq<- subset_seq(genome_seq, cds_gr)
+  cds_length <- cds_seq %>% length()
+  cds_frq <- get_nuc_frequencies(cds_seq, "cds")
+  protein_seq <- cds_seq %>% translate()
+  ## Get intron sequences if there is intron
+  if (n_intron > 0){
+    intron_gr <- gene_tb %>% 
+    filter(type == "intron") %>% 
+    makeGRangesFromDataFrame()
+    intron_seq <- subset_seq(genome_seq, intron_gr)
+    intron_frq <- get_nuc_frequencies(intron_seq, "intron")
+  }else{
+    intron_seq <- ""
+    intron_frq <- tibble()
+  }
+  
+  ## Get GC3
+  GC3 <- get_GC3(cds_seq)
+  
+  result <- tibble(gene_id = gene_id,
+         transcript_id = transcript_id,
+         chr = chr,
+         gene_start = gene_start,
+         gene_end = gene_end,
+         strand = strand,
+         source = source,
+         n_exon = n_exon,
+         cds_length = cds_length,
+         cds_seq = cds_seq %>% as.character(),
+         GC3 = GC3,
+         protein_seq = protein_seq %>% as.character(),
+         n_intron = n_intron,
+         intron_seq = intron_seq %>% as.character()) %>% 
+    bind_cols(cds_frq) 
+  if(n_intron >0){
+    result <- result %>% bind_cols(intron_frq)
+  }
+  result
+}
+```
+
+Main:
+
+```{r eval = FALSE}
+gene_features_list <- mclapply(gene_annotation_list, 
+                               FUN = extract_features, 
+                               genome_seq = genome_seq, 
+                               mc.cores = 7)
+gene_features <- do.call(bind_rows, gene_features_list)
+rm(gene_features_list)
+saveRDS(gene_features, "gene_features.rds")
+```
+
+## Load methylation and busco
+
+```{r}
+gene_features <- read_rds("gene_features.rds") %>% 
+  mutate(pos = (gene_start + gene_end)/2) %>%
+  mutate(cds_CpGoe = cds_o_CG/cds_e_CG,
+         intron_CpGoe = intron_o_CG/intron_e_CG) %>% 
+  mutate(cds_GC = cds_o_C + cds_o_G) %>% 
+  mutate(GC12 = (cds_GC-1/3*GC3)/(2/3)) %>% 
+  mutate(intron_GC = intron_o_C + intron_o_G) %>% 
+  left_join(read_tsv("gene methylation.tsv"), by = c("gene_id" = "ID")) %>% 
+  mutate(n_methylation = ifelse(is.na(n_methylation), 0, n_methylation)) %>% 
+  mutate(intron_length = nchar(intron_seq))
+
+gene_features %>% 
+  mutate(methylated = ifelse(methylated, "Methylated genes", "Unmethylated genes")) %>% 
+  ggplot(aes(x = cds_CpGoe, fill = methylated)) + 
+    geom_density(alpha = 0.5) +
+    theme_bw() +
+    xlab("CpG dinucleotide frequency observed to expected ratio in coding sequences") +
+    ylab("Probability density") +
+    theme(legend.position = "bottom")+
+    guides(fill = guide_legend(title=""))
+ggsave("Methylation versus CpGoe.png")
+```
+
+## Add ffs
+
+```{r}
+gene_features <- gene_features %>% 
+  left_join(read_tsv("../Mar6/ffs_pi.tsv"), by = c("transcript_id" = "tID")) %>% 
+  mutate(ffs_pi = ifelse(is.na(ffs_pi), 0, ffs_pi)) %>% 
+  mutate(n_ffs = ifelse(is.na(n_ffs), 0, n_ffs))
+```
+
+
+
+## Load TE-rich region
+
+```{r}
+TE_rich_regions_gr <- read_tsv("TE_density_classified.tsv") %>% 
+  filter(state == "TE_dense") %>% 
+  mutate(start = pos - 100000, end = pos + 100000, strand = "*") %>% 
+  select(chr, start, end, strand) %>% 
+  makeGRangesFromDataFrame()
+
+gene_gr <- gene_features %>% 
+  select(chr, gene_start, gene_end) %>% 
+  mutate(strand = "*") %>% 
+  makeGRangesFromDataFrame()
+
+overlap_counts <- gene_gr %>% 
+  countOverlaps(TE_rich_regions_gr)
+
+gene_features <- gene_features %>% 
+  mutate(TE_rich_region = overlap_counts > 0)
+rm(overlap_counts)
+```
+
+## Load TE-insertions
+
+```{r}
+TE_gr <- read_gff("v4.W2A.TE_annotation.TEanno.gff3") %>% 
+  filter(!str_detect(attribute, "Method=structural")) %>% 
+  filter(str_detect(seqid, "chr")) %>% 
+  mutate(strand = "*") %>% 
+  makeGRangesFromDataFrame() %>% 
+  GenomicRanges::reduce()
+
+overlap_counts <- gene_gr %>% 
+  countOverlaps(TE_gr)
+
+gene_features <- gene_features %>% 
+  mutate(TE_insertions = overlap_counts)
+
+rm(overlap_counts)
+```
+
+## Calculate codon bias
+
+```{r}
+gene_features_cds <- gene_features$cds_seq %>% DNAStringSet()
+names(gene_features_cds) <- gene_features$gene_id
+```
+
+
+```{r}
+tibble(width = width(gene_features_cds)) %>% 
+  ggplot(aes(x = width)) +
+    geom_histogram() +
+    scale_x_continuous(trans = "log10") +
+    theme_bw()
+gene_features_cds_clean <- gene_features_cds[width(gene_features_cds) > width(gene_features_cds) %>% quantile(0.025) &
+                      width(gene_features_cds) < width(gene_features_cds) %>% quantile(0.975)]
+```
+
+```{r}
+codon_table <- codonTable(gene_features_cds_clean)
+cb_tb <- tibble(gene_id = names(gene_features_cds_clean),
+                #milc = MILC(codon_table) %>% as.vector(),
+                #b = B(codon_table) %>% as.vector(),
+                #enc = ENC(codon_table) %>% as.vector(),
+                #enc_prime = ENCprime(codon_table) %>% as.vector(),
+                mcb = MCB(codon_table) %>% as.vector(),
+                #scuo = SCUO(codon_table) %>% as.vector(),
+               )
+gene_features <- gene_features %>% 
+  left_join(cb_tb)
+rm(gene_features_cds, gene_features_cds_clean, codon_table, cb_tb)
+```
+
+## Load dnds
+
+```{r}
+dnds <- read_tsv("dnds.tsv") %>% 
+  select(query_id, ends_with("Ev_Comeron"))
+names(dnds) <- names(dnds) %>% str_remove("_Ev_Comeron")
+
+gene_features <- gene_features %>% 
+  left_join(dnds, by = c("transcript_id" = "query_id"))
+rm(dnds)
+```
+
+## Show all features
+
+```{r}
+names(gene_features)
+```
+
+```{r}
+ffs_log_base <- 100000
+ffs_pi_min <- gene_features %>% 
+  filter(ffs_pi>0) %>% 
+  pull(ffs_pi) %>% 
+  min()
+
+gene_features %>% 
+  ggplot(aes(x = ffs_pi, fill = TE_rich_region)) +
+    geom_histogram(binwidth = 0.01) +
+    xlim(0,1) +
+    scale_y_continuous(trans = "log10")
+
+wilcox.test(ffs_pi~TE_rich_region, data = gene_features)
+
+gene_features %>% 
+  group_by(TE_rich_region) %>% 
+  summarize(mean_pi = mean(ffs_pi))
+
+gene_features %>% 
+  group_by(TE_rich_region) %>%
+  summarize(total_ffs = sum(n_ffs), mean_pi = sum(ffs_pi*n_ffs)) %>% 
+  mutate(mean_pi = mean_pi/total_ffs)
+
+gene_features %>% 
+  ggplot(aes(x = n_ffs, y = ffs_pi, color = TE_rich_region)) +
+    geom_point(alpha = 0.3) +
+    theme_bw()
+
+gene_features %>% 
+  ggplot(aes(x = n_ffs, fill = TE_rich_region)) +
+    geom_histogram() +
+    scale_y_continuous(trans = "log10")
+```
+
+
+## Random forest
+
+Util:
+
+```{r}
+split_train_test <- function(data, p, size = 10000){
+  # First split by p
+  ind <- sample(2, nrow(data), replace = TRUE, prob = c(1-p, p))
+  train <- data[ind == 1,]
+  test <- data[ind == 2,]
+  # Then resize by resampling
+  resize_data <- function(data, size){
+    out <- data
+    idx_pos <- sample(which(data$TE_rich_region == 1), size/2, replace = TRUE)
+    idx_neg <- sample(which(data$TE_rich_region == 0), size/2, replace = TRUE)
+    data[idx_pos,] %>% 
+      bind_rows(data[idx_neg,])
+  }
+  list(train = resize_data(train, size), test = resize_data(test, size))
+}
+```
+
+
+## Remove useless features
+
+```{r}
+data <- gene_features %>% 
+  select(-c("gene_id", "transcript_id", "chr", "gene_start", "gene_end", "pos",
+            "cds_seq", "protein_seq", "intron_seq")) %>% 
+  select(-"cds_GC") %>% 
+  select(-starts_with("intron_e"), -starts_with("cds_e")) %>% 
+  select(-"intron_CpGoe") %>% 
+  select(-starts_with("cds_o"), -starts_with("intron_o")) %>% 
+  mutate(TE_rich_region = ifelse(TE_rich_region, 1, 0)) %>% 
+  mutate(source = factor(source, levels = c("de novo", "homology"))) %>% 
+  mutate(strand = factor(strand, levels = c("-", "+"))) %>% 
+  mutate(busco = ifelse(busco, "BUSCO", "Non-BUSCO") %>% factor(levels = c("Non-BUSCO", "BUSCO"))) %>% 
+  mutate(methylated = ifelse(methylated, "Methylated", "Not methylated") %>% factor(levels = c("Not methylated", "Methylated"))) %>% 
+  mutate(n_TE_insertion = TE_insertions) %>% select(-TE_insertions) %>% 
+  mutate(MCB = mcb) %>% select(-mcb) %>% 
+  mutate(BUSCO = busco) %>% select(-busco) %>% 
+  drop_na()
+data %>% names()
+data %>% nrow()
+```
+
+```{r}
+set.seed(2014)
+tt <- data %>% 
+  split_train_test(0.2)
+
+rf <- randomForest(TE_rich_region ~ ., 
+                            data =tt$train, 
+                            maxnodes = 5,
+                            importance=TRUE, 
+                            proximity=TRUE,
+                            na.action = na.omit)
+```
+
+```{r}
+## Train cm
+ptrain <- predict(rf, tt$train)
+caret::confusionMatrix((ptrain > 0.5) %>% as.numeric() %>% as.factor(), tt$train$TE_rich_region %>% as.factor())
+## Test cm
+ptest <- predict(rf, tt$test)
+caret::confusionMatrix((ptest > 0.5) %>% as.numeric() %>% as.factor(), tt$test$TE_rich_region %>% as.factor())
+```
+```{r}
+plot(rf)
+```
+
+## Importance analysis
+
+```{r}
+imp_tbl <- importance(rf) %>% as_data_frame(.name_repair = function(str) str %>% str_remove("%")) %>% 
+  mutate(variable = rf %>% importance %>% rownames()) %>% 
+  arrange(desc(IncMSE))
+
+imp_colors <- c("#FF4433","darkorange1", "#00FF66", "steelblue1", "#CC00FF")
+imp_colors_light <- c("#FAA0A0","#FFD580", "#90EE90", "#89CFF0", "#CF9FFF")
+names(imp_colors) <- c("GC content","Gene size","Methylation","Divergence","Others")
+names(imp_colors_light) <- c("GC content","Gene size","Methylation","Divergence","Others")
+
+p_imp <- imp_tbl %>% 
+  mutate(category = NA) %>% 
+  mutate(category = ifelse(variable %in% c("GC12", "GC3", "intron_GC"), "GC content", category)) %>% 
+  mutate(category = ifelse(variable %in% c("n_TE_insertion", "intron_length", "cds_length", "n_intron", "n_exon"), "Gene size", category)) %>% 
+  mutate(category = ifelse(variable %in% c("cds_CpGoe", "methylated", "n_methylation"), "Methylation", category)) %>% 
+  mutate(category = ifelse(variable %in% c("dS", "dN", "dNdS"), "Divergence", category)) %>% 
+  mutate(category = ifelse(is.na(category), "Others", category)) %>% 
+  mutate(category = factor(category, levels = c("GC content", "Gene size", "Methylation", "Divergence", "Others"))) %>% 
+  mutate(variable = factor(variable, levels = imp_tbl$variable %>% rev())) %>% 
+  ggplot(aes(x=variable, y = IncMSE, fill = category)) + 
+    geom_col() +
+    coord_flip() +
+    ylab("Increase MSE (%)") +
+    xlab("") +
+    theme_bw() +
+    theme(legend.position = "bottom") +
+    scale_fill_manual(values = imp_colors_light)+
+    guides(fill = guide_legend(title = "Gene Feature Category")) +
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))
+
+#g_imp <- ggplot_build(p_imp)
+#imp_colors <- unique(g_imp$data[[1]]["fill"]) %>% pull(fill)
+ggsave("Importance plot.pdf", plot = p_imp, width = 210, height = 158, units = "mm")
+```
+
+
+```{r eval = FALSE}
+pdf("partial dependence.pdf", width = 8.5, height = 11)
+par(mfrow=c(6,3))
+partialPlot(rf, tt$train %>% as.data.frame(), GC3, 1, xlim = tt$train$GC3 %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), n_TE_insertion, 1, xlim = tt$train$n_TE_insertion %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), intron_GC, 1, xlim = tt$train$intron_GC %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), MCB, 1, xlim = tt$train$MCB %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), cds_CpGoe, 1, xlim = tt$train$cds_CpGoe %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), intron_length, 1, xlim = tt$train$intron_length %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), GC12, 1, xlim = tt$train$GC12 %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), dS, 1, xlim = tt$train$dS %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), methylated, 1, main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), dNdS, 1, xlim = tt$train$dNdS %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), n_methylation, 1, xlim = tt$train$n_methylation %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), n_exon, 1, xlim = tt$train$n_exon %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), cds_length, 1, xlim = tt$train$cds_length %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), source, 1, main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), dN, 1, xlim = tt$train$dN %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), n_intron, 1, xlim = tt$train$n_intron %>% range(), main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), strand, 1, main = "")
+partialPlot(rf, tt$train %>% as.data.frame(), BUSCO, 1, main = "")
+dev.off()
+```
+
+
+
+```{r}
+p_GC3 <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  ggplot(aes(x = region, y = GC3)) +
+    geom_violin(color = imp_colors["GC content"], draw_quantiles = c(0.25, 0.5, 0.75)) +
+    ggpubr::stat_compare_means(comparisons = list(c("TE-rich regions", "Other regions")), 
+                               label = "p.signif") +
+    theme_bw() +
+    xlab("") +
+    ylim(0, 1) +
+    ylab("Third codon position GC content") +
+    theme(
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))
+p_intronGC <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  ggplot(aes(x = region, y = intron_GC)) +
+    geom_violin(color = imp_colors["GC content"], draw_quantiles = c(0.25, 0.5, 0.75)) +
+    ggpubr::stat_compare_means(comparisons = list(c("TE-rich regions", "Other regions")), 
+                               label = "p.signif") +
+    theme_bw()+
+    xlab("") +
+    ylim(0, 1) +
+    ylab("Intron GC content") +
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))
+
+ggpubr::ggarrange(p_GC3, p_intronGC)
+ggsave("GC content comparison.pdf", width = 210, height = 158, units = "mm")
+```
+
+
+```{r}
+p_n_TE <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  ggplot(aes(x = region, y = n_TE_insertion)) +
+    geom_violin(color = imp_colors["Gene size"], draw_quantiles = c(0.25, 0.5, 0.75)) +
+    ggpubr::stat_compare_means(comparisons = list(c("TE-rich regions", "Other regions")), 
+                               label = "p.signif") +
+    theme_bw() +
+    scale_y_continuous(trans = "log10", labels = scientific_10) +
+    xlab("") +
+    ylab("Number of TE insertions") +
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))
+p_intron_length <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  ggplot(aes(x = region, y = intron_length)) +
+    geom_violin(color = imp_colors["Gene size"], draw_quantiles = c(0.25, 0.5, 0.75)) +
+    ggpubr::stat_compare_means(comparisons = list(c("TE-rich regions", "Other regions")), 
+                               label = "p.signif") +
+    theme_bw() +
+    scale_y_continuous(trans = "log10", labels = scientific_10) +
+    xlab("") +
+    ylab("Intron Length (bp)") +
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))
+ggpubr::ggarrange(p_n_TE, p_intron_length)
+ggsave("Size comparison.pdf", width = 210, height = 158, units = "mm")
+```
+
+
+```{r}
+p_mcb <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  ggplot(aes(x = region, y = MCB)) +
+    geom_violin(color = imp_colors["Others"], draw_quantiles = c(0.25, 0.5, 0.75)) +
+    ggpubr::stat_compare_means(comparisons = list(c("TE-rich regions", "Other regions")), 
+                               label = "p.signif") +
+    theme_bw()+
+    xlab("") +
+    ylab("MCB") +
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))
+p_mcb
+ggsave("MCB.pdf", plot = p_mcb, width = 210, height = 158, units = "mm")
+```
+
+
+```{r}
+data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  ggplot(aes(x = GC3, y = MCB, color = region)) +
+    geom_point(alpha = 0.1)+
+    geom_smooth()+
+    theme_bw()+
+    xlab("GC3") +
+    ylab("MCB") +
+    scale_color_manual(values = c("TE-rich regions" = "#f37401", "Other regions" = "#a6a6a6"))+
+  theme(legend.position = "bottom",
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12)) +
+    guides(color = guide_legend(title=""))
+
+ggsave("MCB versus GC3.pdf")
+```
+
+
+```{r}
+p_cds_CpGoe <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  ggplot(aes(x = region, y = cds_CpGoe)) +
+    geom_violin(color = imp_colors["Methylation"], draw_quantiles = c(0.25, 0.5, 0.75)) +
+    ggpubr::stat_compare_means(comparisons = list(c("TE-rich regions", "Other regions")), 
+                               label = "p.signif") +
+    theme_bw()+
+    xlab("") +
+    ylab("CpG dinucleotide frequency observed to expected ratio in coding sequences") +
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))
+
+p_n_methylation <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  ggplot(aes(x = region, y = n_methylation)) +
+    geom_violin(color = imp_colors["Methylation"], draw_quantiles = c(0.25, 0.5, 0.75)) +
+    ggpubr::stat_compare_means(comparisons = list(c("TE-rich regions", "Other regions")), 
+                               label = "p.signif") +
+    theme_bw()+
+    xlab("") +
+    ylab("Number of methylation")
+ggpubr::ggarrange(p_cds_CpGoe, p_n_methylation) +
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))
+ggsave("Methylation comparison.pdf", width = 210, height = 158, units = "mm")
+```
+
+```{r}
+p_dS <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  ggplot(aes(x = region, y = dS)) +
+    geom_violin(color = imp_colors["Divergence"], draw_quantiles = c(0.25, 0.5, 0.75)) +
+    ggpubr::stat_compare_means(comparisons = list(c("TE-rich regions", "Other regions")), 
+                               label = "p.signif") +
+    theme_bw()+
+    xlab("") +
+    ylab("Synonymous divergence") +
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12, angle = 22.5, hjust=1),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))
+
+p_dN <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  ggplot(aes(x = region, y = dN)) +
+    geom_violin(color = imp_colors["Divergence"], draw_quantiles = c(0.25, 0.5, 0.75)) +
+    ggpubr::stat_compare_means(comparisons = list(c("TE-rich regions", "Other regions")), 
+                               label = "p.signif") +
+    theme_bw()+
+    xlab("") +
+    ylab("Non-synonymous divergence") +
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12, angle = 22.5, hjust=1),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))
+
+p_dNdS <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  ggplot(aes(x = region, y = dNdS)) +
+    geom_violin(color = imp_colors["Divergence"], draw_quantiles = c(0.25, 0.5, 0.75)) +
+    ggpubr::stat_compare_means(comparisons = list(c("TE-rich regions", "Other regions")), 
+                               label = "p.signif") +
+    theme_bw()+
+    xlab("") +
+    ylab("Non-synonymous to synonymous divergence ratio") +
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12, angle = 22.5, hjust=1),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))
+
+ggpubr::ggarrange(p_dS, p_dN, p_dNdS, nrow = 1)
+ggsave("Divergence comparison.pdf", width = 210, height = 158, units = "mm")
+```
+
+```{r}
+p_nTE_intronGC <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  mutate(region = factor(region, levels = c("Other regions", "TE-rich regions"))) %>% 
+  ggplot(aes(x = n_TE_insertion, y = intron_GC, color = region)) +
+    geom_point(alpha = 0.1) +
+    geom_smooth()+
+    theme_bw()+
+    scale_x_continuous(trans = "log10")+
+    scale_color_manual(values = c("TE-rich regions" = "#f37401", "Other regions" = "#a6a6a6"))+
+    xlab("Number of TE insertions") +
+    ylab("Intron GC content") +
+  theme(legend.position = "bottom",
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12)) +
+    guides(color = guide_legend(title=""))
+
+p_nintron_intronGC <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  mutate(region = factor(region, levels = c("Other regions", "TE-rich regions"))) %>% 
+  ggplot(aes(x = n_intron, y = intron_GC, color = region)) +
+    geom_point(alpha = 0.1) +
+    geom_smooth()+
+    theme_bw()+
+    scale_color_manual(values = c("TE-rich regions" = "#f37401", "Other regions" = "#a6a6a6"))+
+    xlab("Number of introns") +
+    ylab("Intron GC content") +
+  theme(legend.position = "bottom",
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))+
+    guides(color = guide_legend(title=""))
+
+p_nintron_nTE <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  mutate(region = factor(region, levels = c("Other regions", "TE-rich regions"))) %>% 
+  ggplot(aes(x = n_intron, y = n_TE_insertion, color = region)) +
+    geom_point(alpha = 0.1) +
+    geom_smooth()+
+    theme_bw()+
+    scale_color_manual(values = c("TE-rich regions" = "#f37401", "Other regions" = "#a6a6a6"))+
+    xlab("Number of introns") +
+    ylab("Number of TE insertions") +
+  theme(legend.position = "bottom",
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))+
+    guides(color = guide_legend(title=""))
+
+p_intronlength_nTE <- data %>% 
+  mutate(region = ifelse(TE_rich_region, "TE-rich regions", "Other regions")) %>% 
+  mutate(region = factor(region, levels = c("Other regions", "TE-rich regions"))) %>% 
+  ggplot(aes(x = intron_length, y = n_TE_insertion, color = region)) +
+    geom_point(alpha = 0.1) +
+    geom_smooth()+
+    theme_bw()+
+    scale_color_manual(values = c("TE-rich regions" = "#f37401", "Other regions" = "#a6a6a6"))+
+    xlab("Intron length") +
+    ylab("Number of TE insertions") +
+  theme(legend.position = "bottom",
+    axis.title.x = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12))+
+    guides(color = guide_legend(title=""))
+
+ggarrange(p_nTE_intronGC, p_nintron_intronGC, p_nintron_nTE, p_intronlength_nTE, ncol = 2, nrow = 2, common.legend = TRUE, legend = "bottom")
+ggsave("IntronGC.pdf", width = 210, height = 210, units = "mm")
+```
+
+
+
+
