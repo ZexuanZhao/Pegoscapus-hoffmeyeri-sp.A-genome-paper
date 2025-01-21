@@ -146,7 +146,7 @@ p2 <- pi %>%
   mutate(state = ifelse(state == "TE-dense", "TE-rich regions", state)) %>% 
   mutate(state = ifelse(state == "background", "Other regions", state)) %>% 
   mutate(g = ifelse(g == "exon", "Exon", g)) %>% 
-  mutate(g = ifelse(g == "intergene", "Intergene", g)) %>% 
+  mutate(g = ifelse(g == "intergene", "Intergenic", g)) %>% 
   mutate(g = ifelse(g == "intron", "Intron", g)) %>% 
   mutate(t = ifelse(t == "non_TE", "Non-TE", t)) %>% 
   mutate(t = ifelse(t == "TE", "TE", t)) %>% 
