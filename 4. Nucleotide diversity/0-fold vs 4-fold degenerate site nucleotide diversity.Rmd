@@ -1,0 +1,221 @@
+---
+title: "Four-fold degenerate sites (FFS) "
+author: "Zexuan Zhao"
+date: "2024-03-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+bin_size <-  10^6
+scientific_10 <- function(x) { parse(text=gsub("e", " %*% 10^", scales::scientific_format()(x)))}
+```
+
+
+## Read degeneracy table and transform them to bed files
+
+```{r eval=FALSE}
+degeneracy <- read_tsv("~/Downloads/degeneracy-all-sites.bed", 
+                      col_names = c("chr", "start", "end", "tID", "code", "refN", "refA", "summary")) %>% 
+  filter(str_detect(chr, "chr")) %>% 
+  select(chr, start, end, code)
+
+zero_fold <- degeneracy %>% 
+  filter(code == 0) %>% 
+  mutate(start = end) %>% 
+  select(chr, start, end)
+
+zero_fold %>% 
+  write_tsv("~/Downloads/zero_fold.bed", col_names = FALSE)
+
+four_fold <- degeneracy %>% 
+  filter(code == 4) %>% 
+  mutate(start = end) %>% 
+  select(chr, start, end)
+
+four_fold %>% 
+  write_tsv("~/Downloads/four_fold.bed", col_names = FALSE)
+```
+
+Run pixy based on bed files.
+
+## Read Pixy results
+
+```{r}
+pi_fourfold_nonTE <- read_tsv("/Users/zexuanzhao/Downloads/four_fold.nonTE-rich_pi.txt") %>% 
+  mutate(site = "fourfold", region = "non-TE-rich") %>% 
+  dplyr::select(chr=chromosome, pos=window_pos_1, site, region, avg_pi, count_diffs, count_comparisons, count_missing) %>% 
+  filter(!is.na(avg_pi))
+pi_fourfold_TE <- read_tsv("/Users/zexuanzhao/Downloads/four_fold.TE-rich_pi.txt") %>% 
+  mutate(site = "fourfold", region = "TE-rich") %>% 
+  dplyr::select(chr=chromosome, pos=window_pos_1, site, region, avg_pi, count_diffs, count_comparisons, count_missing) %>% 
+  filter(!is.na(avg_pi))
+pi_zerofold_nonTE <- read_tsv("/Users/zexuanzhao/Downloads/zero_fold.nonTE-rich_pi.txt") %>% 
+  mutate(site = "zerofold", region = "non-TE-rich") %>% 
+  dplyr::select(chr=chromosome, pos=window_pos_1, site, region, avg_pi, count_diffs, count_comparisons, count_missing) %>% 
+  filter(!is.na(avg_pi))
+pi_zerofold_TE <- read_tsv("/Users/zexuanzhao/Downloads/zero_fold.TE-rich_pi.txt") %>% 
+  mutate(site = "zerofold", region = "TE-rich") %>% 
+  dplyr::select(chr=chromosome, pos=window_pos_1, site, region, avg_pi, count_diffs, count_comparisons, count_missing) %>% 
+  filter(!is.na(avg_pi))
+```
+
+## Merge the pixy results
+
+```{r}
+data <- pi_fourfold_nonTE %>% 
+  bind_rows(pi_fourfold_TE) %>% 
+  bind_rows(pi_zerofold_nonTE) %>% 
+  bind_rows(pi_zerofold_TE) %>% 
+  mutate(region = ifelse(region == "TE-rich", "TE-rich regions", "Other regions")) %>% 
+  mutate(site = ifelse(site == "zerofold", "0-fold degenerate sites", "4-fold degenerate sites"))
+rm(pi_fourfold_nonTE, pi_fourfold_TE, pi_zerofold_nonTE, pi_zerofold_TE)
+```
+
+
+## Aggregate the results by windows
+
+```{r}
+data_windowed <- data %>% 
+  mutate(pos_bin = floor(pos/bin_size)*bin_size) %>% 
+  group_by(chr, pos_bin, site, region) %>% 
+  summarize(avg_pi = sum(count_diffs)/sum(count_comparisons), 
+            total_diffs = sum(count_diffs),
+            total_comparisons = sum(count_comparisons),
+            n_sites = n()) %>% 
+  ungroup() %>% 
+  mutate(window = paste0(chr, ":", pos_bin))
+```
+
+```{r}
+data_windowed %>% 
+  ggplot(aes(x = n_sites)) +
+    geom_histogram() +
+    facet_wrap(region~site, scales = "free")
+
+data_windowed_filtered <- data_windowed %>% 
+  group_by(site, region) %>% 
+  filter(n_sites >= quantile(n_sites, 0.3)) %>% 
+  ungroup()
+
+data_windowed_filtered %>% 
+  ggplot(aes(x = n_sites)) +
+    geom_histogram() +
+    facet_wrap(region~site, scales = "free")
+```
+
+```{r}
+p_barplot_with_error_bar <- data_windowed_filtered %>% 
+  group_by(site, region) %>% 
+  summarize(mean_pi = mean(avg_pi, na.rm = TRUE), sd_pi = sd(avg_pi)) %>% 
+  ggplot(aes(x = region, y = mean_pi, fill = site)) +
+    geom_col(position = "dodge2") +
+    geom_errorbar(aes(ymin=mean_pi+sd_pi, 
+                      ymax=mean_pi+sd_pi),
+                  width = 0.15,
+                 position=position_dodge(.9))+
+    geom_linerange(aes(ymin=mean_pi, 
+                       ymax=mean_pi+sd_pi),
+                 position=position_dodge(.9))+
+    geom_point(size = 2,
+                 position=position_dodge(.9))+
+    scale_y_continuous(labels = scientific_10)+
+    theme_bw() +
+    ylab(expression("Average"~pi)) +
+    xlab("") +
+    theme(legend.title=element_blank())+
+    theme(legend.position="bottom",
+          legend.margin=margin(-20, 0, 0, 0))
+p_barplot_with_error_bar
+```
+```{r}
+data_windowed_filtered %>% 
+  group_by(site, region) %>% 
+  summarize(mean_pi = mean(avg_pi, na.rm = TRUE), sd_pi = sd(avg_pi))
+```
+
+
+```{r}
+int_breaks <- function(x, n = 5) {
+  l <- pretty(x, n)
+  l[abs(l %% 1) < .Machine$double.eps ^ 0.5] 
+}
+
+p1 <- data_windowed_filtered %>% 
+  filter(avg_pi ==0) %>% 
+  ggplot(aes(x = avg_pi, fill = site)) +
+  geom_histogram(bins = 100, position = "dodge2") +
+  facet_wrap(~region, ncol = 1, scales = "free_y") +
+    theme_bw() +
+    ylab("Number of windows") +
+    xlab("")+
+    theme(legend.title=element_blank()) +
+    theme(axis.text.x=element_blank(),
+          axis.ticks.x=element_blank())
+p2 <- data_windowed_filtered %>% 
+  filter(avg_pi !=0) %>% 
+  ggplot(aes(x = avg_pi, fill = site)) +
+  geom_histogram(bins = 100, position = "dodge2") +
+  ylab("") +
+  xlab(expression(pi))+
+  scale_x_continuous(trans = "log10", labels = scientific_10)+
+  facet_wrap(~region, ncol = 1, scales = "free_y") +
+    theme_bw() +
+    scale_y_continuous(breaks = int_breaks)+
+    theme(legend.title=element_blank())
+
+ggpubr::ggarrange(p1, p2, ncol = 2, widths = c(1,4), 
+                  align = "hv",
+                  common.legend = TRUE, legend = "bottom")
+
+wilcox.test(avg_pi ~ site, data = data_windowed_filtered %>% filter(region == "TE-rich regions"))
+
+data_windowed_filtered %>% 
+  filter(avg_pi >0) %>% 
+  group_by(site, region) %>% 
+  summarize(avg_pi = mean(avg_pi)) %>% 
+  pivot_wider(names_from = site, values_from = avg_pi) %>% 
+  mutate(ratio = `0-fold degenerate sites` / `4-fold degenerate sites`)
+```
+
+
+## Zero-inflated poisson regression:
+
+```{r}
+zero_inflated_poisson_model <- pscl::zeroinfl(avg_pi~region * site, 
+                                              data = data_windowed_filtered %>% 
+                                              mutate(avg_pi = round(avg_pi*bin_size, 0)))
+summary(zero_inflated_poisson_model)
+```
+
+
+```{r}
+## Exponentiated coefficients
+expCoef <- exp(coef((zero_inflated_poisson_model)))
+expCoef <- matrix(expCoef, ncol = 2)
+rownames(expCoef) <- names(coef(zero_inflated_poisson_model)) %>% str_remove(".+\\_") %>% unique()
+colnames(expCoef) <- c("Count_model","Zero_inflation_model")
+expCoef
+```
+
+
+## Test: if estimated marginal means of diversity is different between 0-fold and 4-fold degenerate sites in two regions
+
+```{r}
+emmeans::emmeans(zero_inflated_poisson_model, pairwise ~ site | region) 
+
+p_emms <- emmeans::emmeans(zero_inflated_poisson_model, pairwise ~ site | region) %>% 
+  plot(comparisons = TRUE, 
+       xlab = expression(pi~"(x10"^"-6"~")"), 
+       ylab = "")
+```
+
+```{r}
+ggpubr::ggarrange(p_barplot_with_error_bar, p_emms, ncol = 1, labels = c("A", "B"))
+ggsave("~/0-fold vs 4-fold degenerate sites nucleotide diversity.pdf",
+       width = 150,
+       height = 200, 
+       units = "mm")
+```
+
